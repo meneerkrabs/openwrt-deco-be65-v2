@@ -1,0 +1,28 @@
+From: Claude Code <noreply@anthropic.com>
+Subject: [PATCH] dt-bindings: net: wireless: ath12k: add firmware directory
+
+Some PCI devices share an ID while board integration requires a different
+ath12k firmware subtree. Document an opt-in firmware-directory override so
+such boards can select that subtree without changing the default for other
+devices.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+ Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml b/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
+--- a/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
+@@ -27,6 +27,12 @@ properties:
+       If present, a board or platform specific string used to lookup
+       usecase-specific firmware files for the device.
+
++  qcom,firmware-directory:
++    $ref: /schemas/types.yaml#/definitions/string
++    description:
++      Optional firmware directory below ath12k used instead of the directory
++      selected from the PCI device hardware parameters.
++
+   vddaon-supply:
+     description: VDD_AON supply regulator handle

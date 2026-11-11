@@ -1,0 +1,1304 @@
+From: Claude Code <noreply@anthropic.com>
+Subject: [PATCH] net: phy: qca808x: serialize QCA8084 package lifecycle
+
+QCA8084 package resources are shared by four PHY devices. The generic
+one-shot helpers publish their state before initialization completes and
+cannot distinguish successful users from probes still in progress.
+
+Add a package-wide mutex, serialize QCA8084 probe, configuration and
+remove, and keep explicit successful-user and resource state. Build the
+PHY and SerDes support as one module, unwind partial setup, disable package
+clock consumers before their SerDes source, resume interrupted SerDes
+cleanup, retain and reassert the package reset, pair each per-PHY reset
+with devres teardown, preserve failed clock-parent state during recoverable
+setup unwind, and reject ambiguous PCS/XPCS descriptions.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+diff --git a/drivers/net/phy/phy_package.c b/drivers/net/phy/phy_package.c
+index 39e1774..cb35594 100644
+--- a/drivers/net/phy/phy_package.c
++++ b/drivers/net/phy/phy_package.c
+@@ -3,6 +3,7 @@
+  * PHY package support
+  */
+ 
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/phy.h>
+ 
+@@ -15,6 +16,7 @@
+  *   in one package and for offset calculation of phy_package_read/write
+  * @np: Pointer to the Device Node if PHY package defined in DT
+  * @refcnt: Number of PHYs connected to this shared data
++ * @lock: Serializes package-wide driver lifecycle operations
+  * @flags: Initialization of PHY package
+  * @priv_size: Size of the shared private data @priv
+  * @priv: Driver private data shared across a PHY package
+@@ -28,6 +30,8 @@ struct phy_package_shared {
+ 	/* With PHY package defined in DT this points to the PHY package node */
+ 	struct device_node *np;
+ 	refcount_t refcnt;
++	/* Serializes package-wide driver lifecycle operations */
++	struct mutex lock;
+ 	unsigned long flags;
+ 	size_t priv_size;
+ 
+@@ -52,6 +56,18 @@ void *phy_package_get_priv(struct phy_device *phydev)
+ }
+ EXPORT_SYMBOL_GPL(phy_package_get_priv);
+ 
++void phy_package_lock(struct phy_device *phydev)
++{
++	mutex_lock(&phydev->shared->lock);
++}
++EXPORT_SYMBOL_GPL(phy_package_lock);
++
++void phy_package_unlock(struct phy_device *phydev)
++{
++	mutex_unlock(&phydev->shared->lock);
++}
++EXPORT_SYMBOL_GPL(phy_package_unlock);
++
+ static int phy_package_address(struct phy_device *phydev,
+ 			       unsigned int addr_offset)
+ {
+@@ -237,6 +253,7 @@ int phy_package_join(struct phy_device *phydev, int base_addr, size_t priv_size)
+ 		shared->base_addr = base_addr;
+ 		shared->np = NULL;
+ 		refcount_set(&shared->refcnt, 1);
++		mutex_init(&shared->lock);
+ 		bus->shared[base_addr] = shared;
+ 	} else {
+ 		ret = -EINVAL;
+@@ -338,6 +355,7 @@ void phy_package_leave(struct phy_device *phydev)
+ 	if (refcount_dec_and_mutex_lock(&shared->refcnt, &bus->shared_lock)) {
+ 		bus->shared[shared->base_addr] = NULL;
+ 		mutex_unlock(&bus->shared_lock);
++		mutex_destroy(&shared->lock);
+ 		kfree(shared->priv);
+ 		kfree(shared);
+ 	}
+diff --git a/drivers/net/phy/phylib.h b/drivers/net/phy/phylib.h
+index 590c733..302cdc6 100644
+--- a/drivers/net/phy/phylib.h
++++ b/drivers/net/phy/phylib.h
+@@ -11,6 +11,8 @@ struct phy_device;
+ 
+ struct device_node *phy_package_get_node(struct phy_device *phydev);
+ void *phy_package_get_priv(struct phy_device *phydev);
++void phy_package_lock(struct phy_device *phydev);
++void phy_package_unlock(struct phy_device *phydev);
+ int __phy_package_read(struct phy_device *phydev, unsigned int addr_offset,
+ 		       u32 regnum);
+ int __phy_package_write(struct phy_device *phydev, unsigned int addr_offset,
+diff --git a/drivers/net/phy/qcom/Makefile b/drivers/net/phy/qcom/Makefile
+index 8b8fdbd..58b4fd1 100644
+--- a/drivers/net/phy/qcom/Makefile
++++ b/drivers/net/phy/qcom/Makefile
+@@ -2,5 +2,6 @@
+ obj-$(CONFIG_QCOM_NET_PHYLIB)	+= qcom-phy-lib.o
+ obj-$(CONFIG_AT803X_PHY)	+= at803x.o
+ obj-$(CONFIG_QCA83XX_PHY)	+= qca83xx.o
+-obj-$(CONFIG_QCA808X_PHY)	+= qca808x.o qca8084_serdes.o
++obj-$(CONFIG_QCA808X_PHY)	+= qca808x-phy.o
++qca808x-phy-y			:= qca808x.o qca8084_serdes.o
+ obj-$(CONFIG_QCA807X_PHY)	+= qca807x.o
+diff --git a/drivers/net/phy/qcom/qca8084_serdes.c b/drivers/net/phy/qcom/qca8084_serdes.c
+index 932c93c..b11f8a0 100644
+--- a/drivers/net/phy/qcom/qca8084_serdes.c
++++ b/drivers/net/phy/qcom/qca8084_serdes.c
+@@ -151,16 +151,21 @@ struct qca8084_xpcs_channel_priv {
+ 	int ch_id;
+ 	struct reset_control *rstcs;
+ 	struct clk *clks[XPCS_CLK_MAX];
++	struct clk *rx_parent;
++	struct clk *tx_parent;
+ };
+ 
+ struct qca8084_pcs_data {
+ 	struct reset_control *rstc;
+ 	struct clk *clks[PCS_CLK_MAX];
++	bool sgmii_enabled;
+ };
+ 
+ struct qca8084_xpcs_data {
+ 	struct reset_control *rstc;
+ 	struct qca8084_xpcs_channel_priv xpcs_ch[QCA8084_CHANNEL_MAX];
++	bool parents_saved;
++	bool qxgmii_enabled;
+ };
+ 
+ static const char *const xpcs_clock_names[XPCS_CLK_MAX] = {
+@@ -186,172 +191,335 @@ struct mdio_device *qca8084_package_pcs_probe(struct device_node *pcs_np)
+ {
+ 	struct qca8084_pcs_data *pcs_data;
+ 	struct mdio_device *mdiodev;
+-	struct reset_control *rstc;
+ 	struct device *dev;
+-	struct clk *clk;
+-	int i;
++	int i, ret;
+ 
+ 	mdiodev = fwnode_mdio_find_device(of_fwnode_handle(pcs_np));
+ 	if (!mdiodev)
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	dev = &mdiodev->dev;
+-	pcs_data = devm_kzalloc(dev, sizeof(*pcs_data), GFP_KERNEL);
++	pcs_data = kzalloc(sizeof(*pcs_data), GFP_KERNEL);
+ 	if (!pcs_data) {
+-		dev_err(dev, "Allocate PCS data failed\n");
+-		return ERR_PTR(-ENOMEM);
++		ret = -ENOMEM;
++		goto err_mdiodev_put;
+ 	}
+ 
+-	rstc = devm_reset_control_get_exclusive(dev, NULL);
+-	if (IS_ERR(rstc)) {
+-		dev_err(dev, "Get PCS reset failed\n");
+-		return ERR_CAST(rstc);
++	pcs_data->rstc = reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(pcs_data->rstc)) {
++		ret = dev_err_probe(dev, PTR_ERR(pcs_data->rstc),
++				    "PCS reset not ready\n");
++		pcs_data->rstc = NULL;
++		goto err_free;
+ 	}
+ 
+-	pcs_data->rstc = rstc;
+-
+ 	for (i = 0; i < ARRAY_SIZE(pcs_clock_names); i++) {
+-		clk = devm_clk_get(dev, pcs_clock_names[i]);
+-		if (IS_ERR(clk)) {
+-			dev_err(dev, "Failed to get the PCS clock ID %s\n",
+-				pcs_clock_names[i]);
+-			return ERR_CAST(clk);
++		pcs_data->clks[i] = clk_get(dev, pcs_clock_names[i]);
++		if (IS_ERR(pcs_data->clks[i])) {
++			ret = dev_err_probe(dev, PTR_ERR(pcs_data->clks[i]),
++					    "PCS clock %s not ready\n",
++					    pcs_clock_names[i]);
++			pcs_data->clks[i] = NULL;
++			goto err_clk_put;
+ 		}
+-		pcs_data->clks[i] = clk;
+ 	}
+ 
+ 	mdiodev_set_drvdata(mdiodev, pcs_data);
+ 
+ 	return mdiodev;
++
++err_clk_put:
++	while (i--)
++		clk_put(pcs_data->clks[i]);
++	reset_control_put(pcs_data->rstc);
++err_free:
++	kfree(pcs_data);
++err_mdiodev_put:
++	mdio_device_put(mdiodev);
++
++	return ERR_PTR(ret);
+ }
+ 
+ struct mdio_device *qca8084_package_xpcs_probe(struct device_node *xpcs_np)
+ {
+ 	struct qca8084_xpcs_data *xpcs_data;
+ 	struct mdio_device *mdiodev;
+-	struct reset_control *rstc;
+ 	struct device_node *child;
+ 	struct device *dev;
+-	struct clk *clk;
+-	int i, j, node;
++	int channel_count = 0;
++	int i, ret;
++	u32 channel;
+ 
+ 	mdiodev = fwnode_mdio_find_device(of_fwnode_handle(xpcs_np));
+ 	if (!mdiodev)
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	dev = &mdiodev->dev;
+-
+-	xpcs_data = devm_kzalloc(dev, sizeof(*xpcs_data), GFP_KERNEL);
++	xpcs_data = kzalloc(sizeof(*xpcs_data), GFP_KERNEL);
+ 	if (!xpcs_data) {
+-		dev_err(dev, "Allocate XPCS data failed\n");
+-		return ERR_PTR(-ENOMEM);
++		ret = -ENOMEM;
++		goto err_mdiodev_put;
+ 	}
+ 
+-	rstc = devm_reset_control_get_exclusive(dev, NULL);
+-	if (IS_ERR(rstc)) {
+-		dev_err(dev, "Get XPCS reset failed\n");
+-		return ERR_CAST(rstc);
++	xpcs_data->rstc = reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(xpcs_data->rstc)) {
++		ret = dev_err_probe(dev, PTR_ERR(xpcs_data->rstc),
++				    "XPCS reset not ready\n");
++		xpcs_data->rstc = NULL;
++		goto err_free;
+ 	}
+ 
+-	xpcs_data->rstc = rstc;
+-
+-	/* Sanity check the number of channel sub nodes */
+-	node = of_get_available_child_count(xpcs_np);
+-	if (node != QCA8084_CHANNEL_MAX)
+-		return ERR_PTR(-EINVAL);
++	if (of_get_available_child_count(xpcs_np) != QCA8084_CHANNEL_MAX) {
++		ret = -EINVAL;
++		goto err_resources_put;
++	}
+ 
+-	node = 0;
+ 	for_each_available_child_of_node(xpcs_np, child) {
+ 		struct qca8084_xpcs_channel_priv *ch_data;
+-		u32 channel;
+-
+-		/* The subnode name must be 'channel'. */
+-		if (!(of_node_name_eq(child, "channel")))
+-			continue;
++		struct reset_control *rstc;
++		struct clk *clk;
++
++		if (!of_node_name_eq(child, "channel") ||
++		    of_property_read_u32(child, "reg", &channel) ||
++		    channel >= QCA8084_CHANNEL_MAX ||
++		    xpcs_data->xpcs_ch[channel].rstcs) {
++			ret = -EINVAL;
++			of_node_put(child);
++			goto err_resources_put;
++		}
+ 
+-		if (of_property_read_u32(child, "reg", &channel)) {
+-			dev_err(dev, "%s: Failed to get reg\n",
+-				child->full_name);
++		ch_data = &xpcs_data->xpcs_ch[channel];
++		ch_data->ch_id = channel;
++		rstc = of_reset_control_array_get_exclusive(child);
++		if (IS_ERR(rstc)) {
++			ret = dev_err_probe(dev, PTR_ERR(rstc),
++					    "channel %u reset not ready\n",
++					    channel);
++			of_node_put(child);
++			goto err_resources_put;
++		}
++		ch_data->rstcs = rstc;
+ 
+-			mdiodev = ERR_PTR(-EINVAL);
+-			goto put_ch_clk_rst;
++		for (i = 0; i < ARRAY_SIZE(xpcs_clock_names); i++) {
++			clk = of_clk_get_by_name(child, xpcs_clock_names[i]);
++			if (IS_ERR(clk)) {
++				ret = dev_err_probe(dev, PTR_ERR(clk),
++						    "channel %u clock %s not ready\n",
++						    channel, xpcs_clock_names[i]);
++				of_node_put(child);
++				goto err_resources_put;
++			}
++			ch_data->clks[i] = clk;
+ 		}
+ 
+-		if (channel >= QCA8084_CHANNEL_MAX) {
+-			dev_err(dev, "%s: Invalid reg %d\n",
+-				child->full_name, channel);
++		channel_count++;
++	}
+ 
+-			mdiodev = ERR_PTR(-EINVAL);
+-			goto put_ch_clk_rst;
+-		}
++	if (channel_count != QCA8084_CHANNEL_MAX) {
++		ret = -EINVAL;
++		goto err_resources_put;
++	}
+ 
+-		ch_data = &xpcs_data->xpcs_ch[node];
+-		ch_data->ch_id = channel;
++	mdiodev_set_drvdata(mdiodev, xpcs_data);
+ 
+-		ch_data->rstcs = of_reset_control_array_get_exclusive(child);
+-		if (IS_ERR(ch_data->rstcs)) {
+-			dev_err(dev, "%s: Failed to get reset\n",
+-				child->full_name);
++	return mdiodev;
+ 
+-			mdiodev = ERR_CAST(ch_data->rstcs);
+-			goto put_ch_clk_rst;
++err_resources_put:
++	for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
++		struct qca8084_xpcs_channel_priv *ch_data;
++
++		ch_data = &xpcs_data->xpcs_ch[channel];
++		for (i = 0; i < ARRAY_SIZE(ch_data->clks); i++) {
++			if (ch_data->clks[i])
++				clk_put(ch_data->clks[i]);
+ 		}
++		if (ch_data->rstcs)
++			reset_control_put(ch_data->rstcs);
++	}
++	reset_control_put(xpcs_data->rstc);
++err_free:
++	kfree(xpcs_data);
++err_mdiodev_put:
++	mdio_device_put(mdiodev);
+ 
+-		for (j = 0; j < ARRAY_SIZE(xpcs_clock_names); j++) {
+-			clk = of_clk_get_by_name(child, xpcs_clock_names[j]);
+-			if (IS_ERR(clk)) {
+-				dev_err(dev, "Failed to get the clock ID %s\n",
+-					xpcs_clock_names[j]);
+-				mdiodev = ERR_CAST(clk);
+-				goto put_ch_child;
++	return ERR_PTR(ret);
++}
++
++static int
++qca8084_xpcs_restore_clock_parents(struct mdio_device *xpcs_mdiodev)
++{
++	struct qca8084_xpcs_data *xpcs_data;
++	int channel, first_err = 0;
++	int ret;
++
++	if (!xpcs_mdiodev)
++		return 0;
++
++	xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
++	if (!xpcs_data || !xpcs_data->parents_saved)
++		return 0;
++
++	for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
++		struct qca8084_xpcs_channel_priv *ch_data;
++
++		ch_data = &xpcs_data->xpcs_ch[channel];
++		if (ch_data->rx_parent) {
++			ret = clk_set_parent(ch_data->clks[XPCS_RX_SRC_CLK],
++					     ch_data->rx_parent);
++			if (ret) {
++				dev_warn(&xpcs_mdiodev->dev,
++					 "channel %d: failed to restore RX clock parent: %d\n",
++					 channel, ret);
++				if (!first_err)
++					first_err = ret;
++			} else {
++				ch_data->rx_parent = NULL;
+ 			}
+-			ch_data->clks[j] = clk;
+ 		}
+ 
+-		node++;
++		if (ch_data->tx_parent) {
++			ret = clk_set_parent(ch_data->clks[XPCS_TX_SRC_CLK],
++					     ch_data->tx_parent);
++			if (ret) {
++				dev_warn(&xpcs_mdiodev->dev,
++					 "channel %d: failed to restore TX clock parent: %d\n",
++					 channel, ret);
++				if (!first_err)
++					first_err = ret;
++			} else {
++				ch_data->tx_parent = NULL;
++			}
++		}
+ 	}
+ 
+-	mdiodev_set_drvdata(mdiodev, xpcs_data);
++	if (!first_err)
++		xpcs_data->parents_saved = false;
+ 
+-	return mdiodev;
++	return first_err;
++}
++
++int qca8084_qxgmii_unset_mode(struct mdio_device *xpcs_mdiodev,
++			      struct mdio_device *pcs_mdiodev)
++{
++	struct qca8084_xpcs_data *xpcs_data;
++	struct qca8084_pcs_data *pcs_data;
++	int ret;
+ 
+-put_ch_child:
+-	node++;
++	if (!xpcs_mdiodev || !pcs_mdiodev)
++		return 0;
+ 
+-put_ch_clk_rst:
+-	for (i = 0; i < node; i++) {
+-		j--;
+-		while (j >= 0) {
+-			clk_put(xpcs_data->xpcs_ch[i].clks[j]);
+-			j--;
+-		}
++	xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
++	pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
++	if (!xpcs_data || !pcs_data)
++		return 0;
+ 
+-		j = ARRAY_SIZE(xpcs_clock_names);
++	if (xpcs_data->qxgmii_enabled) {
++		ret = reset_control_assert(xpcs_data->rstc);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	for (i = 0; i < node; i++)
+-		reset_control_put(xpcs_data->xpcs_ch[i].rstcs);
++	ret = qca8084_xpcs_restore_clock_parents(xpcs_mdiodev);
++	if (ret)
++		return ret;
+ 
+-	of_node_put(child);
++	if (!xpcs_data->qxgmii_enabled)
++		return 0;
+ 
+-	return mdiodev;
++	ret = reset_control_assert(pcs_data->rstc);
++	if (ret)
++		return ret;
++
++	clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
++	xpcs_data->qxgmii_enabled = false;
++
++	return 0;
+ }
+ 
+-void qca8084_package_xpcs_and_pcs_remove(struct mdio_device *xpcs_mdiodev,
+-					 struct mdio_device *pcs_mdiodev)
++int qca8084_sgmii_unset_mode(struct mdio_device *pcs_mdiodev)
+ {
+-	struct qca8084_xpcs_data *xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
+-	int i, j;
++	struct qca8084_pcs_data *pcs_data;
++	int ret;
++
++	if (!pcs_mdiodev)
++		return 0;
++
++	pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
++	if (!pcs_data || !pcs_data->sgmii_enabled)
++		return 0;
++
++	ret = reset_control_assert(pcs_data->rstc);
++	if (ret)
++		return ret;
++
++	clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
++	pcs_data->sgmii_enabled = false;
++
++	return 0;
++}
++
++int qca8084_package_pcs_remove(struct mdio_device *pcs_mdiodev)
++{
++	struct qca8084_pcs_data *pcs_data;
++	int i, ret;
+ 
+-	for (i = 0; i < ARRAY_SIZE(xpcs_data->xpcs_ch); i++) {
+-		reset_control_put(xpcs_data->xpcs_ch[i].rstcs);
++	if (!pcs_mdiodev)
++		return 0;
+ 
+-		for (j = 0; j < ARRAY_SIZE(xpcs_data->xpcs_ch[i].clks); j++)
+-			clk_put(xpcs_data->xpcs_ch[i].clks[j]);
++	pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
++	ret = qca8084_sgmii_unset_mode(pcs_mdiodev);
++	if (ret && pcs_data->sgmii_enabled) {
++		clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
++		pcs_data->sgmii_enabled = false;
+ 	}
+ 
+-	mdio_device_put(xpcs_mdiodev);
++	for (i = 0; i < ARRAY_SIZE(pcs_data->clks); i++)
++		clk_put(pcs_data->clks[i]);
++	reset_control_put(pcs_data->rstc);
++	kfree(pcs_data);
++	mdiodev_set_drvdata(pcs_mdiodev, NULL);
+ 	mdio_device_put(pcs_mdiodev);
++
++	return ret;
++}
++
++int qca8084_package_xpcs_and_pcs_remove(struct mdio_device *xpcs_mdiodev,
++					struct mdio_device *pcs_mdiodev)
++{
++	struct qca8084_xpcs_data *xpcs_data = NULL;
++	struct qca8084_pcs_data *pcs_data;
++	int channel, first_err, i, ret;
++
++	if (xpcs_mdiodev)
++		xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
++
++	first_err = qca8084_qxgmii_unset_mode(xpcs_mdiodev, pcs_mdiodev);
++	if (first_err && xpcs_data && xpcs_data->qxgmii_enabled) {
++		pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
++		clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
++		xpcs_data->qxgmii_enabled = false;
++	}
++
++	if (xpcs_data) {
++		for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
++			struct qca8084_xpcs_channel_priv *ch_data;
++
++			ch_data = &xpcs_data->xpcs_ch[channel];
++			for (i = 0; i < ARRAY_SIZE(ch_data->clks); i++)
++				clk_put(ch_data->clks[i]);
++			reset_control_put(ch_data->rstcs);
++		}
++		reset_control_put(xpcs_data->rstc);
++		kfree(xpcs_data);
++		mdiodev_set_drvdata(xpcs_mdiodev, NULL);
++		mdio_device_put(xpcs_mdiodev);
++	}
++
++	ret = qca8084_package_pcs_remove(pcs_mdiodev);
++	if (!first_err)
++		first_err = ret;
++
++	return first_err;
+ }
+ 
+ static int qca8084_pcs_set_interface_mode(struct mdio_device *mdio_dev,
+@@ -547,57 +715,75 @@ static int qca8084_xpcs_set_mode(struct mdio_device *xpcs_mdiodev)
+ }
+ 
+ static int qca8084_pcs_set_mode(struct mdio_device *xpcs_mdiodev,
+-				       struct mdio_device *pcs_mdiodev)
++				  struct mdio_device *pcs_mdiodev)
+ {
+ 	struct qca8084_xpcs_data *xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
+ 	struct qca8084_pcs_data *pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
+ 	struct qca8084_xpcs_channel_priv xpcs_ch;
+-	int ret, channel;
++	int channel, cleanup_ret, ret;
+ 
+-	/* Enable clock and de-assert for PCS. */
+ 	ret = clk_prepare_enable(pcs_data->clks[PCS_CLK]);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = reset_control_deassert(pcs_data->rstc);
+ 	if (ret)
+-		return ret;
++		goto err_clk;
++	xpcs_data->qxgmii_enabled = true;
+ 
+-	/* IPG tunning selection for RX, TX and XGMII of all channels. */
+ 	ret = mdiodev_c45_modify(pcs_mdiodev, MDIO_MMD_PMAPMD,
+ 				 BYPASS_TUNNING_IPG,
+ 				 BYPASS_TUNNING_IPG_MASK, 0);
+ 	if (ret)
+-		return ret;
++		goto err_pcs_reset;
+ 
+-	reset_control_assert(xpcs_data->rstc);
++	ret = reset_control_assert(xpcs_data->rstc);
++	if (ret)
++		goto err_pcs_reset;
+ 
+ 	ret = qca8084_pcs_set_interface_mode(pcs_mdiodev,
+ 					     PHY_INTERFACE_MODE_10G_QXGMII);
+ 	if (ret)
+-		return ret;
++		goto err_pcs_reset;
+ 
+-	/* Reset of 4 channels */
+ 	for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
+ 		xpcs_ch = xpcs_data->xpcs_ch[channel];
+ 		ret = reset_control_reset(xpcs_ch.rstcs);
+ 		if (ret)
+-			return ret;
++			goto err_pcs_reset;
+ 	}
+ 
+ 	ret = qca8084_do_calibration(pcs_mdiodev);
+ 	if (ret) {
+ 		dev_err(&pcs_mdiodev->dev, "PCS calibration timeout!\n");
+-		return ret;
++		goto err_pcs_reset;
+ 	}
+ 
+-	/* Enable PCS SSC to fix mode */
+ 	ret = mdiodev_c45_modify(pcs_mdiodev, MDIO_MMD_PMAPMD,
+ 				 CDR_CONTRL, SSC_FIX_MODE, SSC_FIX_MODE);
+ 	if (ret)
+-		return ret;
++		goto err_pcs_reset;
++
++	ret = reset_control_deassert(xpcs_data->rstc);
++	if (ret)
++		goto err_pcs_reset;
++
++	return 0;
+ 
+-	return reset_control_deassert(xpcs_data->rstc);
++err_pcs_reset:
++	cleanup_ret = qca8084_qxgmii_unset_mode(xpcs_mdiodev, pcs_mdiodev);
++	if (cleanup_ret) {
++		dev_err(&pcs_mdiodev->dev,
++			"failed to unwind PCS setup: %d\n", cleanup_ret);
++		return cleanup_ret;
++	}
++
++	return ret;
++
++err_clk:
++	clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
++
++	return ret;
+ }
+ 
+ static int qca8084_xpcs_clock_parent_set(struct mdio_device *xpcs_mdiodev,
+@@ -605,23 +791,45 @@ static int qca8084_xpcs_clock_parent_set(struct mdio_device *xpcs_mdiodev,
+ {
+ 	struct qca8084_xpcs_data *xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
+ 	struct qca8084_pcs_data *pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
+-	struct qca8084_xpcs_channel_priv xpcs_ch;
+-	int ret, channel;
++	int channel, restore_ret, ret;
++
++	if (xpcs_data->parents_saved)
++		return 0;
+ 
+ 	for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
+-		xpcs_ch = xpcs_data->xpcs_ch[channel];
+-		ret = clk_set_parent(xpcs_ch.clks[XPCS_RX_SRC_CLK],
++		struct qca8084_xpcs_channel_priv *ch_data;
++
++		ch_data = &xpcs_data->xpcs_ch[channel];
++		ch_data->rx_parent = clk_get_parent(ch_data->clks[XPCS_RX_SRC_CLK]);
++		ch_data->tx_parent = clk_get_parent(ch_data->clks[XPCS_TX_SRC_CLK]);
++		if (!ch_data->rx_parent || !ch_data->tx_parent)
++			return -EINVAL;
++	}
++	xpcs_data->parents_saved = true;
++
++	for (channel = 0; channel < QCA8084_CHANNEL_MAX; channel++) {
++		struct qca8084_xpcs_channel_priv *ch_data;
++
++		ch_data = &xpcs_data->xpcs_ch[channel];
++		ret = clk_set_parent(ch_data->clks[XPCS_RX_SRC_CLK],
+ 				     pcs_data->clks[PCS_RX_ROOT_CLK]);
+ 		if (ret)
+-			return ret;
++			goto err_restore;
+ 
+-		ret = clk_set_parent(xpcs_ch.clks[XPCS_TX_SRC_CLK],
++		ret = clk_set_parent(ch_data->clks[XPCS_TX_SRC_CLK],
+ 				     pcs_data->clks[PCS_TX_ROOT_CLK]);
+ 		if (ret)
+-			return ret;
++			goto err_restore;
+ 	}
+ 
+ 	return 0;
++
++err_restore:
++	restore_ret = qca8084_xpcs_restore_clock_parents(xpcs_mdiodev);
++	if (restore_ret)
++		return restore_ret;
++
++	return ret;
+ }
+ 
+ /* Defined further down; needed by qca8084_sgmii_set_mode() below. */
+@@ -645,7 +853,17 @@ int qca8084_sgmii_set_mode(struct mdio_device *pcs_mdiodev,
+ 			   phy_interface_t interface)
+ {
+ 	struct qca8084_pcs_data *pcs_data = mdiodev_get_drvdata(pcs_mdiodev);
+-	int ret;
++	int cleanup_ret, ret;
++
++	if (pcs_data->sgmii_enabled) {
++		cleanup_ret = qca8084_sgmii_unset_mode(pcs_mdiodev);
++		if (cleanup_ret) {
++			dev_err(&pcs_mdiodev->dev,
++				"failed to resume SGMII cleanup: %d\n",
++				cleanup_ret);
++			return cleanup_ret;
++		}
++	}
+ 
+ 	ret = clk_prepare_enable(pcs_data->clks[PCS_CLK]);
+ 	if (ret)
+@@ -654,6 +872,7 @@ int qca8084_sgmii_set_mode(struct mdio_device *pcs_mdiodev,
+ 	ret = reset_control_deassert(pcs_data->rstc);
+ 	if (ret)
+ 		goto err_clk;
++	pcs_data->sgmii_enabled = true;
+ 
+ 	/* IPG tuning selection for RX, TX and XGMII of all channels. */
+ 	ret = mdiodev_c45_modify(pcs_mdiodev, MDIO_MMD_PMAPMD,
+@@ -715,28 +934,65 @@ int qca8084_sgmii_set_mode(struct mdio_device *pcs_mdiodev,
+ 	return 0;
+ 
+ err_reset:
+-	reset_control_assert(pcs_data->rstc);
++	cleanup_ret = qca8084_sgmii_unset_mode(pcs_mdiodev);
++	if (cleanup_ret) {
++		dev_err(&pcs_mdiodev->dev,
++			"failed to unwind SGMII setup: %d\n", cleanup_ret);
++		return cleanup_ret;
++	}
++
++	return ret;
++
+ err_clk:
+ 	clk_disable_unprepare(pcs_data->clks[PCS_CLK]);
+ 
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(qca8084_sgmii_set_mode);
+ 
+ int qca8084_qxgmii_set_mode(struct mdio_device *xpcs_mdiodev,
+-			    struct mdio_device *pcs_mdiodev)
++				    struct mdio_device *pcs_mdiodev)
+ {
+-	int ret;
++	struct qca8084_xpcs_data *xpcs_data;
++	int cleanup_ret, ret;
++
++	if (!xpcs_mdiodev || !pcs_mdiodev)
++		return -ENODEV;
++
++	xpcs_data = mdiodev_get_drvdata(xpcs_mdiodev);
++	if (xpcs_data->qxgmii_enabled || xpcs_data->parents_saved) {
++		cleanup_ret = qca8084_qxgmii_unset_mode(xpcs_mdiodev,
++							pcs_mdiodev);
++		if (cleanup_ret) {
++			dev_err(&xpcs_mdiodev->dev,
++				"failed to resume QXGMII cleanup: %d\n",
++				cleanup_ret);
++			return cleanup_ret;
++		}
++	}
+ 
+-	ret = qca8084_xpcs_clock_parent_set(xpcs_mdiodev, pcs_mdiodev);
++	ret = qca8084_pcs_set_mode(xpcs_mdiodev, pcs_mdiodev);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = qca8084_pcs_set_mode(xpcs_mdiodev, pcs_mdiodev);
++	ret = qca8084_xpcs_clock_parent_set(xpcs_mdiodev, pcs_mdiodev);
+ 	if (ret)
+-		return ret;
++		goto err_unset_mode;
+ 
+-	return qca8084_xpcs_set_mode(xpcs_mdiodev);
++	ret = qca8084_xpcs_set_mode(xpcs_mdiodev);
++	if (ret)
++		goto err_unset_mode;
++
++	return 0;
++
++err_unset_mode:
++	cleanup_ret = qca8084_qxgmii_unset_mode(xpcs_mdiodev, pcs_mdiodev);
++	if (cleanup_ret) {
++		dev_err(&xpcs_mdiodev->dev,
++			"failed to unwind QXGMII setup: %d\n", cleanup_ret);
++		return cleanup_ret;
++	}
++
++	return ret;
+ }
+ 
+ static int qca8084_pcs_ipg_tune_reset(struct mdio_device *mdio_dev,
+diff --git a/drivers/net/phy/qcom/qca8084_serdes.h b/drivers/net/phy/qcom/qca8084_serdes.h
+index b943529..2663827 100644
+--- a/drivers/net/phy/qcom/qca8084_serdes.h
++++ b/drivers/net/phy/qcom/qca8084_serdes.h
+@@ -14,12 +14,16 @@
+ 
+ struct mdio_device *qca8084_package_pcs_probe(struct device_node *pcs_np);
+ struct mdio_device *qca8084_package_xpcs_probe(struct device_node *xpcs_np);
+-void qca8084_package_xpcs_and_pcs_remove(struct mdio_device *xpcs_mdiodev,
+-					 struct mdio_device *pcs_mdiodev);
++int qca8084_package_pcs_remove(struct mdio_device *pcs_mdiodev);
++int qca8084_package_xpcs_and_pcs_remove(struct mdio_device *xpcs_mdiodev,
++					struct mdio_device *pcs_mdiodev);
+ int qca8084_sgmii_set_mode(struct mdio_device *pcs_mdiodev,
+ 			   phy_interface_t interface);
++int qca8084_sgmii_unset_mode(struct mdio_device *pcs_mdiodev);
+ int qca8084_qxgmii_set_mode(struct mdio_device *xpcs_mdiodev,
+ 			    struct mdio_device *pcs_mdiodev);
++int qca8084_qxgmii_unset_mode(struct mdio_device *xpcs_mdiodev,
++			      struct mdio_device *pcs_mdiodev);
+ void qca8084_qxgmii_set_speed(struct mdio_device *xpcs_mdiodev,
+ 			      struct mdio_device *pcs_mdiodev,
+ 			      int channel, int speed);
+diff --git a/drivers/net/phy/qcom/qca808x.c b/drivers/net/phy/qcom/qca808x.c
+index 64f8c56..4cbe712 100644
+--- a/drivers/net/phy/qcom/qca808x.c
++++ b/drivers/net/phy/qcom/qca808x.c
+@@ -188,9 +188,14 @@ struct qca808x_priv {
+ };
+ 
+ struct qca808x_shared_priv {
+-	int package_mode;
++	u32 package_mode;
+ 	struct clk *clk[PACKAGE_CLK_MAX];
+ 	struct mdio_device *mdiodev[2];	/* PCS and XPCS mdio device */
++	struct reset_control *package_rstc;
++	unsigned int users;
++	bool resources_acquired;
++	bool clocks_enabled;
++	bool config_initialized;
+ };
+ 
+ static const char *const qca8084_package_clk_name[PACKAGE_CLK_MAX] = {
+@@ -868,6 +873,36 @@ static void qca808x_get_phy_stats(struct phy_device *phydev,
+ 	qcom_phy_get_stats(stats, priv->hw_stats);
+ }
+ 
++static void qca8084_package_clock_deinit(struct qca808x_shared_priv *shared_priv)
++{
++	if (!shared_priv->clocks_enabled)
++		return;
++
++	clk_disable_unprepare(shared_priv->clk[MDIO_AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[MDIO_MASTER_AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[CNOC_AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[TLMM_AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[TLMM_CLK]);
++	clk_disable_unprepare(shared_priv->clk[SEC_CTRL_AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[AHB_CLK]);
++	clk_disable_unprepare(shared_priv->clk[APB_BRIDGE_CLK]);
++	clk_disable_unprepare(shared_priv->clk[SWITCH_CORE_CLK]);
++	shared_priv->clocks_enabled = false;
++}
++
++static void qca8084_package_clock_put(struct qca808x_shared_priv *shared_priv)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(shared_priv->clk); i++) {
++		if (!shared_priv->clk[i])
++			continue;
++
++		clk_put(shared_priv->clk[i]);
++		shared_priv->clk[i] = NULL;
++	}
++}
++
+ static int qca8084_package_clock_init(struct qca808x_shared_priv *shared_priv)
+ {
+ 	int ret;
+@@ -885,46 +920,71 @@ static int qca8084_package_clock_init(struct qca808x_shared_priv *shared_priv)
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[APB_BRIDGE_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_switch_core;
+ 
+ 	/* Configure clock rate 104.17MHZ for the PHY package
+ 	 * AHB clock tree.
+ 	 */
+ 	ret = clk_set_rate(shared_priv->clk[AHB_CLK], 104170000);
+ 	if (ret)
+-		return ret;
++		goto err_apb_bridge;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[AHB_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_apb_bridge;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[SEC_CTRL_AHB_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_ahb;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[TLMM_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_sec_ctrl_ahb;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[TLMM_AHB_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_tlmm;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[CNOC_AHB_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_tlmm_ahb;
+ 
+ 	ret = clk_prepare_enable(shared_priv->clk[MDIO_MASTER_AHB_CLK]);
+ 	if (ret)
+-		return ret;
++		goto err_cnoc_ahb;
++
++	ret = clk_prepare_enable(shared_priv->clk[MDIO_AHB_CLK]);
++	if (ret)
++		goto err_mdio_master_ahb;
++
++	shared_priv->clocks_enabled = true;
++
++	return 0;
++
++err_mdio_master_ahb:
++	clk_disable_unprepare(shared_priv->clk[MDIO_MASTER_AHB_CLK]);
++err_cnoc_ahb:
++	clk_disable_unprepare(shared_priv->clk[CNOC_AHB_CLK]);
++err_tlmm_ahb:
++	clk_disable_unprepare(shared_priv->clk[TLMM_AHB_CLK]);
++err_tlmm:
++	clk_disable_unprepare(shared_priv->clk[TLMM_CLK]);
++err_sec_ctrl_ahb:
++	clk_disable_unprepare(shared_priv->clk[SEC_CTRL_AHB_CLK]);
++err_ahb:
++	clk_disable_unprepare(shared_priv->clk[AHB_CLK]);
++err_apb_bridge:
++	clk_disable_unprepare(shared_priv->clk[APB_BRIDGE_CLK]);
++err_switch_core:
++	clk_disable_unprepare(shared_priv->clk[SWITCH_CORE_CLK]);
+ 
+-	return clk_prepare_enable(shared_priv->clk[MDIO_AHB_CLK]);
++	return ret;
+ }
+ 
+ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
+ {
+ 	struct qca808x_shared_priv *shared_priv;
+-	int ret, mode;
++	int cleanup_ret, mode, ret;
+ 
+ 	shared_priv = phy_package_get_priv(phydev);
+ 	switch (shared_priv->package_mode) {
+@@ -938,7 +998,7 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
+ 		mode = QCA8084_WORK_MODE_SWITCH_PORT4_SGMII;
+ 		break;
+ 	default:
+-		phydev_err(phydev, "Invalid qcom,package-mode %d\n",
++		phydev_err(phydev, "Invalid qcom,package-mode %u\n",
+ 			   shared_priv->package_mode);
+ 		return -EINVAL;
+ 	}
+@@ -1012,18 +1072,42 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
+ 	/* Initialize the PHY package clock and reset, which is the
+ 	 * necessary config sequence after GPIO reset on the PHY package.
+ 	 */
+-	return qca8084_package_clock_init(shared_priv);
++	ret = qca8084_package_clock_init(shared_priv);
++	if (!ret)
++		return 0;
++
++	if (shared_priv->package_mode ==
++	    QCA808X_PCS1_SGMII_MAC_PCS0_SGMII_MAC ||
++	    shared_priv->package_mode ==
++	    QCA808X_PCS1_SGMII_MAC_PCS0_SGMII_PHY)
++		cleanup_ret = qca8084_sgmii_unset_mode(shared_priv->mdiodev[0]);
++	else
++		cleanup_ret = qca8084_qxgmii_unset_mode(shared_priv->mdiodev[1],
++							shared_priv->mdiodev[0]);
++	if (cleanup_ret) {
++		phydev_err(phydev, "package clock unwind failed: %d\n",
++			   cleanup_ret);
++		return cleanup_ret;
++	}
++
++	return ret;
+ }
+ 
+ static int qca8084_config_init(struct phy_device *phydev)
+ {
++	struct qca808x_shared_priv *shared_priv;
+ 	int ret;
+ 
+-	if (phy_package_init_once(phydev)) {
++	shared_priv = phy_package_get_priv(phydev);
++	phy_package_lock(phydev);
++	if (!shared_priv->config_initialized) {
+ 		ret = qca8084_phy_package_config_init_once(phydev);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
++
++		shared_priv->config_initialized = true;
+ 	}
++	phy_package_unlock(phydev);
+ 
+ 	if (phydev->interface == PHY_INTERFACE_MODE_10G_QXGMII)
+ 		__set_bit(PHY_INTERFACE_MODE_10G_QXGMII,
+@@ -1047,6 +1131,10 @@ static int qca8084_config_init(struct phy_device *phydev)
+ 	return phy_write_mmd(phydev, MDIO_MMD_PMAPMD,
+ 			     QCA8084_MSE_THRESHOLD,
+ 			     QCA8084_MSE_THRESHOLD_2P5G_VAL);
++
++out_unlock:
++	phy_package_unlock(phydev);
++	return ret;
+ }
+ 
+ static void qca8084_link_change_notify(struct phy_device *phydev)
+@@ -1116,12 +1204,11 @@ static void qca8084_link_change_notify(struct phy_device *phydev)
+  */
+ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+ {
+-	int addr[QCA8084_MDIO_DEVICE_NUM] = {0, 1, 2, 3, 4, 5, 6};
++	u32 addr[QCA8084_MDIO_DEVICE_NUM] = {0, 1, 2, 3, 4, 5, 6};
+ 	struct device_node *np = phy_package_get_node(phydev);
+ 	struct qca808x_shared_priv *shared_priv;
+-	struct reset_control *rstc;
+ 	struct device_node *child;
+-	int i, ret, clear, set;
++	int cleanup_ret = 0, clear, i, ret, set;
+ 	struct clk *clk;
+ 
+ 	/* Program the MDIO address of PHY and PCS optionally, the MDIO
+@@ -1132,6 +1219,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+ 	if (ret && ret != -EINVAL)
+ 		return ret;
+ 
++	for (i = 0; i < ARRAY_SIZE(addr); i++)
++		if (addr[i] >= PHY_MAX_ADDR)
++			return -EINVAL;
++
+ 	/* Configure the MDIO addresses for the four PHY devices. */
+ 	clear = QCA8084_EPHY_ADDR0_MASK | QCA8084_EPHY_ADDR1_MASK |
+ 		QCA8084_EPHY_ADDR2_MASK | QCA8084_EPHY_ADDR3_MASK;
+@@ -1161,12 +1252,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+ 	for (i = 0; i < ARRAY_SIZE(qca8084_package_clk_name); i++) {
+ 		clk = of_clk_get_by_name(np, qca8084_package_clk_name[i]);
+ 		if (IS_ERR(clk)) {
+-			if (PTR_ERR(clk) == -EINVAL)
+-				clk = NULL;
+-			else
+-				return dev_err_probe(&phydev->mdio.dev, PTR_ERR(clk),
+-						     "package clock %s not ready\n",
+-						     qca8084_package_clk_name[i]);
++			ret = dev_err_probe(&phydev->mdio.dev, PTR_ERR(clk),
++					    "package clock %s not ready\n",
++					    qca8084_package_clk_name[i]);
++			goto err_clock_put;
+ 		}
+ 
+ 		shared_priv->clk[i] = clk;
+@@ -1179,91 +1268,195 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+ 	ret = of_property_read_u32(np, "qcom,package-mode",
+ 				   &shared_priv->package_mode);
+ 	if (ret && ret != -EINVAL)
+-		return ret;
++		goto err_clock_put;
+ 
+ 	for_each_available_child_of_node(np, child) {
+ 		struct mdio_device *mdiodev;
+ 
+ 		if (of_node_name_eq(child, "pcs-phy")) {
++			if (shared_priv->mdiodev[0]) {
++				phydev_err(phydev, "multiple pcs-phy nodes are unsupported\n");
++				ret = -EINVAL;
++				of_node_put(child);
++				goto err_mdiodev_put;
++			}
++
+ 			mdiodev = qca8084_package_pcs_probe(child);
+-			if (IS_ERR(mdiodev))
+-				return PTR_ERR(mdiodev);
++			if (IS_ERR(mdiodev)) {
++				ret = PTR_ERR(mdiodev);
++				of_node_put(child);
++				goto err_mdiodev_put;
++			}
+ 
+ 			shared_priv->mdiodev[0] = mdiodev;
+ 		}
+ 
+ 		if (of_node_name_eq(child, "xpcs-phy")) {
++			if (shared_priv->mdiodev[1]) {
++				phydev_err(phydev, "multiple xpcs-phy nodes are unsupported\n");
++				ret = -EINVAL;
++				of_node_put(child);
++				goto err_mdiodev_put;
++			}
++
+ 			mdiodev = qca8084_package_xpcs_probe(child);
+-			if (IS_ERR(mdiodev))
+-				return PTR_ERR(mdiodev);
++			if (IS_ERR(mdiodev)) {
++				ret = PTR_ERR(mdiodev);
++				of_node_put(child);
++				goto err_mdiodev_put;
++			}
+ 
+ 			shared_priv->mdiodev[1] = mdiodev;
+ 		}
+ 	}
+ 
+-	rstc = of_reset_control_get_exclusive(np, NULL);
+-	if (IS_ERR(rstc))
+-		return dev_err_probe(&phydev->mdio.dev, PTR_ERR(rstc),
+-				     "package reset not ready\n");
++	shared_priv->package_rstc = of_reset_control_get_exclusive(np, NULL);
++	if (IS_ERR(shared_priv->package_rstc)) {
++		ret = dev_err_probe(&phydev->mdio.dev,
++				    PTR_ERR(shared_priv->package_rstc),
++				    "package reset not ready\n");
++		shared_priv->package_rstc = NULL;
++		goto err_mdiodev_put;
++	}
++
++	/* Keep the handle for a matching assert on final package teardown. */
++	ret = reset_control_deassert(shared_priv->package_rstc);
++	if (ret) {
++		reset_control_put(shared_priv->package_rstc);
++		shared_priv->package_rstc = NULL;
++		goto err_mdiodev_put;
++	}
++
++	shared_priv->resources_acquired = true;
++
++	return 0;
+ 
+-	/* Deassert PHY package. */
+-	return reset_control_deassert(rstc);
++err_mdiodev_put:
++	cleanup_ret = qca8084_package_xpcs_and_pcs_remove(shared_priv->mdiodev[1],
++							  shared_priv->mdiodev[0]);
++	shared_priv->mdiodev[0] = NULL;
++	shared_priv->mdiodev[1] = NULL;
++err_clock_put:
++	qca8084_package_clock_put(shared_priv);
++
++	return cleanup_ret ? cleanup_ret : ret;
+ }
+ 
+-static void qca8084_phy_package_remove_once(struct phy_device *phydev)
++static int qca8084_phy_package_remove(struct phy_device *phydev)
+ {
+-	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);;
++	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);
++	int first_err, ret;
++
++	if (!shared_priv->resources_acquired)
++		return 0;
+ 
+-	qca8084_package_xpcs_and_pcs_remove(shared_priv->mdiodev[1],
+-					    shared_priv->mdiodev[0]);
++	/* Package clocks consume the SerDes clock. Disable the consumers before
++	 * asserting the PCS reset or disabling its source clock.
++	 */
++	qca8084_package_clock_deinit(shared_priv);
++	first_err = qca8084_package_xpcs_and_pcs_remove(shared_priv->mdiodev[1],
++							shared_priv->mdiodev[0]);
++	shared_priv->mdiodev[0] = NULL;
++	shared_priv->mdiodev[1] = NULL;
++
++	ret = reset_control_assert(shared_priv->package_rstc);
++	if (ret) {
++		phydev_err(phydev, "package reset assertion failed: %d\n", ret);
++		if (!first_err)
++			first_err = ret;
++	}
++	reset_control_put(shared_priv->package_rstc);
++	shared_priv->package_rstc = NULL;
++
++	qca8084_package_clock_put(shared_priv);
++	shared_priv->config_initialized = false;
++	shared_priv->resources_acquired = false;
++
++	return first_err;
+ }
+ 
+ static int qca8084_probe(struct phy_device *phydev)
+ {
+ 	struct qca808x_shared_priv *shared_priv;
+ 	struct device *dev = &phydev->mdio.dev;
++	bool package_probe_owner = false;
+ 	struct reset_control *rstc;
+ 	struct clk *clk;
++	int cleanup_ret;
+ 	int ret;
+ 
+ 	ret = devm_of_phy_package_join(dev, phydev, sizeof(*shared_priv));
+ 	if (ret)
+ 		return ret;
+ 
+-	if (phy_package_probe_once(phydev)) {
++	shared_priv = phy_package_get_priv(phydev);
++	phy_package_lock(phydev);
++	if (!shared_priv->resources_acquired) {
+ 		ret = qca8084_phy_package_probe_once(phydev);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
++		package_probe_owner = true;
+ 	}
+ 
+ 	ret = qca808x_probe(phydev);
+ 	if (ret)
+-		return ret;
++		goto err_package_probe;
+ 
+ 	/* Enable clock of PHY device, so that the PHY register
+ 	 * can be accessed to get PHY features.
+ 	 */
+ 	clk = devm_clk_get_enabled(dev, NULL);
+-	if (IS_ERR(clk))
+-		return dev_err_probe(dev, PTR_ERR(clk),
+-				     "Enable PHY clock failed\n");
++	if (IS_ERR(clk)) {
++		ret = dev_err_probe(dev, PTR_ERR(clk),
++				    "Enable PHY clock failed\n");
++		goto err_package_probe;
++	}
++
++	/* Deassert the PHY reset after enabling its clock, and let devres assert it
++	 * again before releasing the reset on detach or probe failure.
++	 */
++	rstc = devm_reset_control_get_exclusive_deasserted(dev, NULL);
++	if (IS_ERR(rstc)) {
++		ret = dev_err_probe(dev, PTR_ERR(rstc),
++				    "Get and deassert PHY reset failed\n");
++		goto err_package_probe;
++	}
+ 
+-	/* De-assert PHY reset after the clock of PHY enabled. */
+-	rstc = devm_reset_control_get_exclusive(dev, NULL);
+-	if (IS_ERR(rstc))
+-		return dev_err_probe(dev, PTR_ERR(rstc),
+-				     "Get PHY reset failed\n");
++	shared_priv->users++;
++	phy_package_unlock(phydev);
+ 
+-	return reset_control_deassert(rstc);
++	return 0;
++
++err_package_probe:
++	if (package_probe_owner && !shared_priv->users) {
++		cleanup_ret = qca8084_phy_package_remove(phydev);
++		if (cleanup_ret)
++			phydev_err(phydev, "package probe cleanup failed: %d\n",
++				   cleanup_ret);
++	}
++out_unlock:
++	phy_package_unlock(phydev);
++
++	return ret;
+ }
+ 
+ static void qca8084_remove(struct phy_device *phydev)
+ {
+-	if (phydev->interface != PHY_INTERFACE_MODE_10G_QXGMII)
+-		return;
++	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);
++	int ret = 0;
++
++	phy_package_lock(phydev);
++	if (WARN_ON(!shared_priv->users))
++		goto out_unlock;
+ 
+-	if (phy_package_remove_once(phydev))
+-		qca8084_phy_package_remove_once(phydev);
++	shared_priv->users--;
++	if (!shared_priv->users)
++		ret = qca8084_phy_package_remove(phydev);
++
++out_unlock:
++	phy_package_unlock(phydev);
++	if (ret)
++		phydev_err(phydev, "package teardown failed: %d\n", ret);
+ }
+ 
+ static struct phy_driver qca808x_driver[] = {

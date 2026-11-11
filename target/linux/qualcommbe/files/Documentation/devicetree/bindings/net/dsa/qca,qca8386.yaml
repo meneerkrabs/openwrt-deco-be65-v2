@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/dsa/qca,qca8386.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm QCA8386 Ethernet switch
+
+maintainers:
+  - Luca C <clubdog123@gmail.com>
+
+description:
+  The QCA8386 is a six-port switch core in the QCA8084 package. Ports 1 through
+  4 connect to the package's internal 2.5G PHYs. Ports 0 and 5 are CPU-capable
+  ports. The switch registers are accessed indirectly through an MDIO window.
+
+properties:
+  compatible:
+    const: qca,qca8386
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    minItems: 20
+    maxItems: 20
+
+  clock-names:
+    items:
+      - const: mac0_tx
+      - const: mac0_rx
+      - const: mac0_tx_srds1
+      - const: mac0_rx_srds1
+      - const: mac1_tx
+      - const: mac1_rx
+      - const: mac1_gephy_tx
+      - const: mac1_gephy_rx
+      - const: mac2_tx
+      - const: mac2_rx
+      - const: mac2_gephy_tx
+      - const: mac2_gephy_rx
+      - const: mac3_tx
+      - const: mac3_rx
+      - const: mac3_gephy_tx
+      - const: mac3_gephy_rx
+      - const: mac4_tx
+      - const: mac4_rx
+      - const: mac4_gephy_tx
+      - const: mac4_gephy_rx
+
+  resets:
+    minItems: 11
+    maxItems: 13
+
+  reset-names:
+    minItems: 11
+    items:
+      - const: switch_core
+      - const: mac0_tx
+      - const: mac0_rx
+      - const: mac1_tx
+      - const: mac1_rx
+      - const: mac2_tx
+      - const: mac2_rx
+      - const: mac3_tx
+      - const: mac3_rx
+      - const: mac4_tx
+      - const: mac4_rx
+      - const: mac5_tx
+      - const: mac5_rx
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+allOf:
+  - $ref: dsa.yaml#/$defs/ethernet-ports
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    mdio {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        switch@10 {
+            compatible = "qca,qca8386";
+            reg = <0x10>;
+
+            clocks = <&nsscc 0>, <&nsscc 1>, <&nsscc 2>, <&nsscc 3>,
+                     <&nsscc 4>, <&nsscc 5>, <&nsscc 6>, <&nsscc 7>,
+                     <&nsscc 8>, <&nsscc 9>, <&nsscc 10>, <&nsscc 11>,
+                     <&nsscc 12>, <&nsscc 13>, <&nsscc 14>, <&nsscc 15>,
+                     <&nsscc 16>, <&nsscc 17>, <&nsscc 18>, <&nsscc 19>;
+            clock-names = "mac0_tx", "mac0_rx",
+                          "mac0_tx_srds1", "mac0_rx_srds1",
+                          "mac1_tx", "mac1_rx",
+                          "mac1_gephy_tx", "mac1_gephy_rx",
+                          "mac2_tx", "mac2_rx",
+                          "mac2_gephy_tx", "mac2_gephy_rx",
+                          "mac3_tx", "mac3_rx",
+                          "mac3_gephy_tx", "mac3_gephy_rx",
+                          "mac4_tx", "mac4_rx",
+                          "mac4_gephy_tx", "mac4_gephy_rx";
+
+            resets = <&nsscc 0>, <&nsscc 1>, <&nsscc 2>, <&nsscc 3>,
+                     <&nsscc 4>, <&nsscc 5>, <&nsscc 6>, <&nsscc 7>,
+                     <&nsscc 8>, <&nsscc 9>, <&nsscc 10>;
+            reset-names = "switch_core", "mac0_tx", "mac0_rx",
+                          "mac1_tx", "mac1_rx", "mac2_tx", "mac2_rx",
+                          "mac3_tx", "mac3_rx", "mac4_tx", "mac4_rx";
+
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                    reg = <0>;
+                    ethernet = <&gmac1>;
+                    phy-mode = "2500base-x";
+
+                    fixed-link {
+                        speed = <2500>;
+                        full-duplex;
+                    };
+                };
+
+                port@1 {
+                    reg = <1>;
+                    label = "lan1";
+                    phy-mode = "internal";
+                    phy-handle = <&phy1>;
+                };
+            };
+        };
+    };
+...

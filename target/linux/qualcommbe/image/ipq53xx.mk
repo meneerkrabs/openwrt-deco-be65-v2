@@ -70,6 +70,26 @@ define Device/glinet_gl-be6500
 endef
 TARGET_DEVICES += glinet_gl-be6500
 
+define Device/tplink_be65-v2
+	$(call Device/FitImage)
+	DEVICE_VENDOR := TP-Link
+	DEVICE_MODEL := Deco BE65 V2
+	DEVICE_VARIANT := Experimental diagnostics
+	# The filename retains the vendor prefix, unlike the default derived from
+	# the profile name.
+	DEVICE_DTS := ipq5332-tplink-be65-v2
+	# The dumped APPSBL contains config@BE65_2_0_0 for this board.
+	DEVICE_DTS_CONFIG := config@BE65_2_0_0
+	SOC := ipq5332
+	# Fail closed while Ethernet and Wi-Fi are still being qualified: emit only
+	# the initramfs FIT selected by CONFIG_TARGET_ROOTFS_INITRAMFS. In particular,
+	# do not expose factory, UBI or persistent sysupgrade artifacts.
+	IMAGES :=
+	DEVICE_PACKAGES := ethtool
+	BROKEN := y
+endef
+TARGET_DEVICES += tplink_be65-v2
+
 define Device/glinet_gl-be9300
 	$(call Device/FitImage)
 	$(call Device/EmmcImage)

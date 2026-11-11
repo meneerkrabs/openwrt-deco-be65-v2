@@ -1,0 +1,195 @@
+From: Claude Code <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 15:10:00 +0100
+Subject: [PATCH] wifi: ath12k: download rxgainlut over QMI
+
+QCN9224 firmware can advertise that it needs a receive-gain lookup table.
+Port the public QSDK protocol extension with the following behavior:
+
+* decode capability TLV 0x25 as the u8 that the response structure
+  actually contains;
+* look for a board-2.bin type-2 entry first;
+* fall back to rxgainlut.b<board-id>, then rxgainlut.bin; and
+* download the result using QMI BDF type 7.
+
+The downstream patch describes the one-byte capability as
+QMI_UNSIGNED_8_BYTE.  Use QMI_UNSIGNED_1_BYTE here to avoid decoding an
+eight-byte value into a u8 field.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 57 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/core.h |  3 ++
+ drivers/net/wireless/ath/ath12k/hw.h   | 15 +++++++
+ drivers/net/wireless/ath/ath12k/qmi.c  | 38 +++++++++++++++++
+ drivers/net/wireless/ath/ath12k/qmi.h  |  3 ++
+ 5 files changed, 116 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index e87165e..5414210 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -578,2 +578,59 @@ success:
+ 
++int ath12k_core_fetch_rxgainlut(struct ath12k_base *ab,
++				struct ath12k_board_data *bd)
++{
++	char boardname[BOARD_NAME_SIZE] = {};
++	char fallback_boardname[BOARD_NAME_SIZE] = {};
++	char filename[BOARD_NAME_SIZE];
++	int ret;
++
++	ret = ath12k_core_create_board_name(ab, boardname, sizeof(boardname));
++	if (ret) {
++		ath12k_err(ab, "failed to create rxgainlut board name: %d\n", ret);
++		return ret;
++	}
++
++	ret = ath12k_core_fetch_board_data_api_n(ab, bd, boardname,
++						 ATH12K_BD_IE_RXGAINLUT,
++						 ATH12K_BD_IE_RXGAINLUT_NAME,
++						 ATH12K_BD_IE_RXGAINLUT_DATA);
++	if (!ret)
++		goto success;
++
++	ret = ath12k_core_create_fallback_board_name(ab, fallback_boardname,
++						     sizeof(fallback_boardname));
++	if (ret) {
++		ath12k_err(ab, "failed to create fallback rxgainlut name: %d\n", ret);
++		return ret;
++	}
++
++	ret = ath12k_core_fetch_board_data_api_n(ab, bd, fallback_boardname,
++						 ATH12K_BD_IE_RXGAINLUT,
++						 ATH12K_BD_IE_RXGAINLUT_NAME,
++						 ATH12K_BD_IE_RXGAINLUT_DATA);
++	if (!ret)
++		goto success;
++
++	snprintf(filename, sizeof(filename), "%s%04x",
++		 ATH12K_RXGAINLUT_FILE_PREFIX, ab->qmi.target.board_id);
++
++	ret = ath12k_core_fetch_board_data_api_1(ab, bd, filename);
++	if (ret) {
++		ath12k_dbg(ab, ATH12K_DBG_BOOT, "failed to fetch %s from %s\n",
++			   filename, ab->hw_params->fw.dir);
++
++		ret = ath12k_core_fetch_board_data_api_1(ab, bd,
++							 ATH12K_RXGAINLUT_FILE);
++		if (ret) {
++			ath12k_warn(ab, "failed to fetch default %s from %s\n",
++				    ATH12K_RXGAINLUT_FILE, ab->hw_params->fw.dir);
++			return ret;
++		}
++	}
++
++success:
++	ath12k_dbg(ab, ATH12K_DBG_BOOT, "fetched rxgainlut\n");
++	return 0;
++}
++
+ int ath12k_core_fetch_regdb(struct ath12k_base *ab, struct ath12k_board_data *bd)
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index e4a42d9..11cd8ae 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1159,2 +1159,3 @@ struct ath12k_base {
+ 	enum ath12k_qmi_mem_mode target_mem_mode;
++	bool rxgainlut_support;
+ 
+@@ -1279,2 +1280,4 @@ void ath12k_core_free_bdf(struct ath12k_base *ab, struct ath12k_board_data *bd);
+ int ath12k_core_fetch_regdb(struct ath12k_base *ab, struct ath12k_board_data *bd);
++int ath12k_core_fetch_rxgainlut(struct ath12k_base *ab,
++				struct ath12k_board_data *bd);
+ int ath12k_core_check_dt(struct ath12k_base *ath12k);
+diff --git a/drivers/net/wireless/ath/ath12k/hw.h b/drivers/net/wireless/ath/ath12k/hw.h
+index 8d2fa0b..4305b97 100644
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -100,2 +100,4 @@ struct ieee80211_rx_status;
+ #define ATH12K_REGDB_FILE_NAME		"regdb.bin"
++#define ATH12K_RXGAINLUT_FILE_PREFIX	"rxgainlut.b"
++#define ATH12K_RXGAINLUT_FILE		"rxgainlut.bin"
+ 
+@@ -309,2 +311,7 @@ enum ath12k_bd_ie_regdb_type {
+ 
++enum ath12k_bd_ie_rxgainlut_type {
++	ATH12K_BD_IE_RXGAINLUT_NAME = 0,
++	ATH12K_BD_IE_RXGAINLUT_DATA = 1,
++};
++
+ enum ath12k_bd_ie_type {
+@@ -314,2 +321,4 @@ enum ath12k_bd_ie_type {
+ 	ATH12K_BD_IE_REGDB = 1,
++	/* contains sub IEs of enum ath12k_bd_ie_rxgainlut_type */
++	ATH12K_BD_IE_RXGAINLUT = 2,
+ };
+@@ -323,2 +332,4 @@ static inline const char *ath12k_bd_ie_type_str(enum ath12k_bd_ie_type type)
+ 		return "regdb data";
++	case ATH12K_BD_IE_RXGAINLUT:
++		return "rxgainlut data";
+ 	}
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index fd762b5..393bea0 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -1424,2 +1424,20 @@ static const struct qmi_elem_info qmi_wlanfw_cap_resp_msg_v01_ei[] = {
+ 	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x25,
++		.offset		= offsetof(struct qmi_wlanfw_cap_resp_msg_v01,
++					   rxgainlut_support_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x25,
++		.offset		= offsetof(struct qmi_wlanfw_cap_resp_msg_v01,
++					   rxgainlut_support),
++	},
+ 	{
+@@ -2934,2 +2952,5 @@ int ath12k_qmi_request_target_cap(struct ath12k_base *ab)
+ 
++	if (resp.rxgainlut_support_valid)
++		ab->rxgainlut_support = !!resp.rxgainlut_support;
++
+ 	ath12k_info(ab, "chip_id 0x%x chip_family 0x%x board_id 0x%x soc_id 0x%x\n",
+@@ -3084,2 +3105,9 @@ int ath12k_qmi_load_bdf_qmi(struct ath12k_base *ab,
+ 		break;
++	case ATH12K_QMI_BDF_TYPE_RXGAINLUT:
++		ret = ath12k_core_fetch_rxgainlut(ab, &bd);
++		if (ret) {
++			ath12k_warn(ab, "qmi failed to load rxgainlut\n");
++			goto out;
++		}
++		break;
+ 	case ATH12K_QMI_BDF_TYPE_CALIBRATION:
+@@ -3790,2 +3818,10 @@ int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+ 
++	if (ab->rxgainlut_support) {
++		ret = ath12k_qmi_load_bdf_qmi(ab,
++					      ATH12K_QMI_BDF_TYPE_RXGAINLUT);
++		if (ret < 0)
++			ath12k_warn(ab,
++				    "qmi failed to load rxgainlut: %d\n", ret);
++	}
++
+ 	if (hw_params->download_calib) {
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.h b/drivers/net/wireless/ath/ath12k/qmi.h
+index 2a63e21..98bce68 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -56,2 +56,3 @@ enum ath12k_qmi_bdf_type {
+ 	ATH12K_QMI_BDF_TYPE_CALIBRATION		= 5,
++	ATH12K_QMI_BDF_TYPE_RXGAINLUT		= 7,
+ };
+@@ -495,2 +496,4 @@ struct qmi_wlanfw_cap_resp_msg_v01 {
+ 	struct qmi_wlanfw_dev_mem_info_s_v01 dev_mem[ATH12K_QMI_WLFW_MAX_DEV_MEM_NUM_V01];
++	u8 rxgainlut_support_valid;
++	u8 rxgainlut_support;
+ };

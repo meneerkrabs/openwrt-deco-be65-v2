@@ -1,0 +1,43 @@
+From: Claude Code <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 15:00:00 +0100
+Subject: [PATCH] wifi: ath12k: allow DT firmware directory override
+
+QCN9224 uses PCI ID 0x1109, which upstream maps to the QCN9274
+hardware parameters and consequently to QCN9274/hw2.0.  Boards such as
+the TP-Link BE65 V2 instead ship compatible firmware and board data in
+QCN92XX/hw1.0.
+
+Add a qcom,firmware-directory property which replaces the hardware
+parameter directory for every firmware request, including board and
+regulatory data.  Keep the existing firmware-name use-case subdirectory
+semantics when the new property is absent.
+
+This is deliberately opt-in so genuine QCN9274 devices sharing the PCI
+ID keep their upstream firmware directory.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 829ad4f..3b2afb6 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1360,8 +1360,16 @@ static inline void ath12k_core_create_firmware_path(struct ath12k_base *ab,
+ 						    const char *filename,
+ 						    void *buf, size_t buf_len)
+ {
++	const char *fw_dir = NULL;
+ 	const char *fw_name = NULL;
+ 
++	if (!of_property_read_string(ab->dev->of_node,
++				     "qcom,firmware-directory", &fw_dir)) {
++		snprintf(buf, buf_len, "%s/%s/%s", ATH12K_FW_DIR,
++			 fw_dir, filename);
++		return;
++	}
++
+ 	if (ab->hif.bus == ATH12K_BUS_PCI)
+ 		of_property_read_string(ab->dev->of_node, "firmware-name", &fw_name);
+ 

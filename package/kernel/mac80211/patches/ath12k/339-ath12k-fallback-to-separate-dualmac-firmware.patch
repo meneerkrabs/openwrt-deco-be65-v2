@@ -1,0 +1,49 @@
+From: Claude Code <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 15:05:00 +0100
+Subject: [PATCH] wifi: ath12k: fall back to separate dual-MAC firmware
+
+Some QCN9224 firmware distributions provide amss_dualmac.bin as a
+separate file instead of embedding an ATH12K_FW_IE_AMSS_DUALMAC_IMAGE in
+firmware-N.bin.
+
+When OTP selects dual-MAC mode, continue to prefer the embedded image.
+If it is absent, let MHI request amss_dualmac.bin through the ordinary
+ath12k firmware path.  Do not import the unrelated MLO and QRTR behavior
+changes from the downstream implementation.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+ drivers/net/wireless/ath/ath12k/hw.h  | 1 +
+ drivers/net/wireless/ath/ath12k/mhi.c | 8 ++++----
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/hw.h b/drivers/net/wireless/ath/ath12k/hw.h
+index 8d2fa0b..ba1d9d2 100644
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -95,6 +95,7 @@ struct ieee80211_rx_status;
+ #define ATH12K_DEFAULT_BOARD_FILE	"board.bin"
+ #define ATH12K_DEFAULT_CAL_FILE		"caldata.bin"
+ #define ATH12K_AMSS_FILE		"amss.bin"
++#define ATH12K_AMSS_DUALMAC_FILE	"amss_dualmac.bin"
+ #define ATH12K_M3_FILE			"m3.bin"
+ #define ATH12K_AUX_UC_FILE		"aux_ucode.bin"
+ #define ATH12K_REGDB_FILE_NAME		"regdb.bin"
+diff --git a/drivers/net/wireless/ath/ath12k/mhi.c b/drivers/net/wireless/ath/ath12k/mhi.c
+index ee87f00..0d2c151 100644
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -224,9 +224,10 @@ int ath12k_mhi_register(struct ath12k_pci *ab_pci)
+ 			mhi_ctrl->fw_data = ab->fw.amss_dualmac_data;
+ 			mhi_ctrl->fw_sz = ab->fw.amss_dualmac_len;
+ 		} else {
+-			ath12k_warn(ab, "dualmac firmware IE not present in firmware-N.bin\n");
+-			ret = -ENOENT;
+-			goto free_controller;
++			ath12k_core_create_firmware_path(ab, ATH12K_AMSS_DUALMAC_FILE,
++							 ab_pci->amss_path,
++							 sizeof(ab_pci->amss_path));
++			mhi_ctrl->fw_image = ab_pci->amss_path;
+ 		}
+ 	} else {
+ 		if (ab->fw.amss_data && ab->fw.amss_len > 0) {

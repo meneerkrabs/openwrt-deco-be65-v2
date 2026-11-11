@@ -1,0 +1,53 @@
+From: Claude Code <noreply@anthropic.com>
+Subject: [PATCH] dt-bindings: net: qca8084: add missing package clocks
+
+The driver programs the MDIO master AHB and switch core clocks in addition
+to the seven clocks in the original binding. Add both to the fixed clock
+tuple and update the example; dt-schema derives the exact nine-item
+requirement from that tuple.
+
+Signed-off-by: Claude Code <noreply@anthropic.com>
+---
+diff --git a/Documentation/devicetree/bindings/net/qcom,qca8084.yaml b/Documentation/devicetree/bindings/net/qcom,qca8084.yaml
+index 672b1f6..37c862b 100644
+--- a/Documentation/devicetree/bindings/net/qcom,qca8084.yaml
++++ b/Documentation/devicetree/bindings/net/qcom,qca8084.yaml
+@@ -59,6 +59,8 @@ properties:
+       - description: TLMM AHB clock
+       - description: CNOC AHB clock
+       - description: MDIO AHB clock
++      - description: MDIO master AHB clock
++      - description: Switch core clock
+ 
+   clock-names:
+     items:
+@@ -69,6 +71,8 @@ properties:
+       - const: tlmm_ahb
+       - const: cnoc_ahb
+       - const: mdio_ahb
++      - const: mdio_master_ahb
++      - const: switch_core
+ 
+   resets:
+     description:
+@@ -295,14 +299,18 @@ examples:
+                      <&qca8k_nsscc NSS_CC_TLMM_CLK>,
+                      <&qca8k_nsscc NSS_CC_TLMM_AHB_CLK>,
+                      <&qca8k_nsscc NSS_CC_CNOC_AHB_CLK>,
+-                     <&qca8k_nsscc NSS_CC_MDIO_AHB_CLK>;
++                     <&qca8k_nsscc NSS_CC_MDIO_AHB_CLK>,
++                     <&qca8k_nsscc NSS_CC_MDIO_MASTER_AHB_CLK>,
++                     <&qca8k_nsscc NSS_CC_SWITCH_CORE_CLK>;
+             clock-names = "apb_bridge",
+                           "ahb",
+                           "sec_ctrl_ahb",
+                           "tlmm",
+                           "tlmm_ahb",
+                           "cnoc_ahb",
+-                          "mdio_ahb";
++                          "mdio_ahb",
++                          "mdio_master_ahb",
++                          "switch_core";
+             resets = <&qca8k_nsscc NSS_CC_GEPHY_FULL_ARES>;
+             qcom,package-mode = <QCA808X_PCS1_10G_QXGMII_PCS0_UNUNSED>;
+             qcom,phy-addr-fixup = <1 2 3 4 5 6 7>;

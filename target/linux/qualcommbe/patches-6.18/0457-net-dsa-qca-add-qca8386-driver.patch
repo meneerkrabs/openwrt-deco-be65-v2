@@ -1,0 +1,37 @@
+From: Luca C <clubdog123@gmail.com>
+Subject: [PATCH] net: dsa: qca: add qca8386 driver
+
+The QCA8386 (Manhattan) is the switch fabric in front of the four QCA8084
+EPHYs on IPQ53xx/IPQ5018 boards. It has no DSA driver in mainline; qca8k
+covers the QCA8327/QCA8337 only.
+
+Add the Kconfig symbol and Makefile entry for a qca8386 DSA driver forked
+from qca8k. The driver itself is supplied via target files/.
+
+The switch has six ports: user ports 1-4 and CPU-capable ports 0 and 5.
+
+Signed-off-by: Luca C <clubdog123@gmail.com>
+---
+--- a/drivers/net/dsa/qca/Kconfig
++++ b/drivers/net/dsa/qca/Kconfig
+@@ -24,3 +24,13 @@
+ 	help
+ 	  This enabled support for LEDs present on the Qualcomm Atheros
+ 	  QCA8K Ethernet switch chips.
++
++config NET_DSA_QCA8386
++	tristate "Qualcomm QCA8386 (Manhattan) Ethernet switch support"
++	depends on NET_DSA
++	select NET_DSA_TAG_QCA
++	select REGMAP
++	help
++	  This enables support for the Qualcomm QCA8386 ("Manhattan"/MHT)
++	  six port Ethernet switch: four user ports (1-4) in front of the
++	  QCA8084 EPHYs and two CPU-capable ports (0 and 5).
+--- a/drivers/net/dsa/qca/Makefile
++++ b/drivers/net/dsa/qca/Makefile
+@@ -5,3 +5,4 @@
+ ifdef CONFIG_NET_DSA_QCA8K_LEDS_SUPPORT
+ qca8k-y				+= qca8k-leds.o
+ endif
++obj-$(CONFIG_NET_DSA_QCA8386)	+= qca8386.o
