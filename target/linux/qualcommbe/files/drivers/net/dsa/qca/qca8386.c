@@ -33,6 +33,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/phy.h>
 #include <linux/netdevice.h>
 #include <linux/bitfield.h>
@@ -129,7 +130,47 @@
 #define   QCA8386_EGRESS_VLAN_PORT(_i, x) \
 	((x) << QCA8386_EGRESS_VLAN_PORT_SHIFT(_i))
 
-/* Upper bound of the switch-core register window. */
+/* MHT uses the HPPE L2 FDB command window. Public QSDK 12.1 SSDK and the
+ * matching BE65 qca-ssdk binary both implement per-port fast ageing by walking
+ * all 2048 entries, then deleting or rewriting dynamic entries that reference
+ * the port. These registers live above the qca8k-compatible switch-core window,
+ * so the FDB helpers use the full-width indirect-MDIO accessors directly.
+ */
+#define QCA8386_IPE_L2_BASE			0x060000
+#define QCA8386_FDB_TBL_OP			(QCA8386_IPE_L2_BASE + 0x008)
+#define QCA8386_FDB_TBL_RD_OP			(QCA8386_IPE_L2_BASE + 0x010)
+#define QCA8386_FDB_TBL_OP_RSLT		(QCA8386_IPE_L2_BASE + 0x020)
+#define QCA8386_FDB_TBL_RD_OP_RSLT		(QCA8386_IPE_L2_BASE + 0x030)
+#define QCA8386_FDB_TBL_RD_RSLT_DATA(_i)	(QCA8386_IPE_L2_BASE + 0x200 + ((_i) * 4))
+#define QCA8386_FDB_TBL_OP_DATA(_i)		(QCA8386_IPE_L2_BASE + 0x230 + ((_i) * 4))
+#define QCA8386_FDB_TBL_RD_DATA(_i)		(QCA8386_IPE_L2_BASE + 0x260 + ((_i) * 4))
+#define QCA8386_FDB_TBL_NUM			2048
+#define QCA8386_FDB_CMD_ID_MODULUS		0x0f
+#define QCA8386_FDB_RSLT_VALID_MAX		8
+
+#define QCA8386_FDB_OP_CMD_ID			GENMASK(3, 0)
+#define QCA8386_FDB_OP_TYPE			GENMASK(7, 5)
+#define QCA8386_FDB_OP_HASH_BLOCKS		GENMASK(9, 8)
+#define QCA8386_FDB_OP_MODE			BIT(10)
+#define QCA8386_FDB_OP_ENTRY_INDEX		GENMASK(21, 11)
+#define QCA8386_FDB_OP_TYPE_ADD		0
+#define QCA8386_FDB_OP_TYPE_DEL		1
+#define QCA8386_FDB_OP_TYPE_GET		2
+#define QCA8386_FDB_OP_MODE_INDEX		1
+#define QCA8386_FDB_OP_HASH_BLOCKS_ALL		3
+
+#define QCA8386_FDB_RSLT_CMD_ID		GENMASK(3, 0)
+#define QCA8386_FDB_RSLT_VALID_CNT		GENMASK(8, 5)
+#define QCA8386_FDB_DATA1_ENTRY_VALID		BIT(16)
+#define QCA8386_FDB_DATA1_DST_INFO_LO		GENMASK(31, 24)
+#define QCA8386_FDB_DATA2_DST_INFO_HI		GENMASK(2, 0)
+#define QCA8386_FDB_DATA2_DST_TYPE		GENMASK(5, 4)
+#define QCA8386_FDB_DATA2_HIT_AGE		GENMASK(11, 10)
+#define QCA8386_FDB_DST_TYPE_PORT		2
+#define QCA8386_FDB_DST_TYPE_PORT_MAP		3
+#define QCA8386_FDB_HIT_AGE_STATIC		3
+
+/* Upper bound of the qca8k-compatible switch-core register window. */
 #define QCA8386_MAX_REGISTER			0x16ac
 
 struct qca8386_info {
@@ -183,6 +224,7 @@ struct qca8386_priv {
 	struct regmap *regmap;
 	struct dsa_switch *ds;
 	const struct qca8386_info *info;
+	struct mutex fdb_lock; /* Serializes multi-register FDB operations. */
 
 	struct reset_control_bulk_data resets[QCA8386_NUM_RESETS];
 	struct clk_bulk_data clks[QCA8386_NUM_CLKS];
@@ -356,7 +398,8 @@ qca8386_set_page(struct qca8386_priv *priv, u16 page)
 		return ret;
 	}
 
-	usleep_range(1000, 2000);
+	/* Public QSDK MHT requires at least 100 us for the page to settle. */
+	fsleep(100);
 	return 0;
 }
 
@@ -517,6 +560,155 @@ static int qca8386_write(struct qca8386_priv *priv, u32 reg, u32 val)
 static int qca8386_rmw(struct qca8386_priv *priv, u32 reg, u32 mask, u32 write_val)
 {
 	return regmap_update_bits(priv->regmap, reg, mask, write_val);
+}
+
+static int qca8386_fdb_result_check(u32 result, u32 cmd_id)
+{
+	if (FIELD_GET(QCA8386_FDB_RSLT_CMD_ID, result) != cmd_id ||
+	    FIELD_GET(QCA8386_FDB_RSLT_VALID_CNT, result) >
+		    QCA8386_FDB_RSLT_VALID_MAX)
+		return -EIO;
+
+	return 0;
+}
+
+static int qca8386_fdb_entry_read(struct qca8386_priv *priv, u32 index,
+				  u32 data[3])
+{
+	u32 cmd_id = index % QCA8386_FDB_CMD_ID_MODULUS;
+	u32 operation, result;
+	int ret, i;
+
+	for (i = 0; i < 3; i++) {
+		ret = qca8386_write_mii(priv, QCA8386_FDB_TBL_RD_DATA(i), 0);
+		if (ret)
+			return ret;
+	}
+
+	operation = FIELD_PREP(QCA8386_FDB_OP_CMD_ID, cmd_id) |
+		    FIELD_PREP(QCA8386_FDB_OP_TYPE,
+			       QCA8386_FDB_OP_TYPE_GET) |
+		    FIELD_PREP(QCA8386_FDB_OP_HASH_BLOCKS,
+			       QCA8386_FDB_OP_HASH_BLOCKS_ALL) |
+		    QCA8386_FDB_OP_MODE |
+		    FIELD_PREP(QCA8386_FDB_OP_ENTRY_INDEX, index);
+	ret = qca8386_write_mii(priv, QCA8386_FDB_TBL_RD_OP, operation);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = qca8386_read_mii(priv, QCA8386_FDB_TBL_RD_RSLT_DATA(i),
+				       &data[i]);
+		if (ret)
+			return ret;
+	}
+
+	ret = qca8386_read_mii(priv, QCA8386_FDB_TBL_RD_OP_RSLT, &result);
+	if (ret)
+		return ret;
+
+	ret = qca8386_fdb_result_check(result, cmd_id);
+	if (ret)
+		return ret;
+
+	if (!(data[1] & QCA8386_FDB_DATA1_ENTRY_VALID) ||
+	    !FIELD_GET(QCA8386_FDB_DATA2_DST_TYPE, data[2]))
+		return -ENOENT;
+
+	return 0;
+}
+
+static int qca8386_fdb_entry_modify(struct qca8386_priv *priv, u32 data[3],
+				    u32 op_type)
+{
+	u32 operation, result, discard;
+	int ret, i;
+
+	for (i = 0; i < 3; i++) {
+		ret = qca8386_write_mii(priv, QCA8386_FDB_TBL_OP_DATA(i),
+					data[i]);
+		if (ret)
+			return ret;
+	}
+
+	operation = FIELD_PREP(QCA8386_FDB_OP_TYPE, op_type) |
+		    FIELD_PREP(QCA8386_FDB_OP_HASH_BLOCKS,
+			       QCA8386_FDB_OP_HASH_BLOCKS_ALL);
+	ret = qca8386_write_mii(priv, QCA8386_FDB_TBL_OP, operation);
+	if (ret)
+		return ret;
+
+	/* SSDK reads the result-data window before checking the command result. */
+	for (i = 0; i < 3; i++) {
+		ret = qca8386_read_mii(priv, QCA8386_FDB_TBL_RD_RSLT_DATA(i),
+				       &discard);
+		if (ret)
+			return ret;
+	}
+
+	ret = qca8386_read_mii(priv, QCA8386_FDB_TBL_OP_RSLT, &result);
+	if (ret)
+		return ret;
+
+	return qca8386_fdb_result_check(result, 0);
+}
+
+static int qca8386_fdb_fast_age_port(struct qca8386_priv *priv, int port)
+{
+	u32 data[3], destination_hi, destination_lo, destination_type;
+	int ret = 0;
+	u32 index;
+
+	mutex_lock(&priv->fdb_lock);
+
+	for (index = 0; index < QCA8386_FDB_TBL_NUM; index++) {
+		ret = qca8386_fdb_entry_read(priv, index, data);
+		if (ret == -ENOENT)
+			continue;
+		if (ret)
+			break;
+
+		if (FIELD_GET(QCA8386_FDB_DATA2_HIT_AGE, data[2]) ==
+		    QCA8386_FDB_HIT_AGE_STATIC)
+			continue;
+
+		destination_type = FIELD_GET(QCA8386_FDB_DATA2_DST_TYPE,
+					     data[2]);
+		destination_lo = FIELD_GET(QCA8386_FDB_DATA1_DST_INFO_LO,
+					   data[1]);
+		destination_hi = FIELD_GET(QCA8386_FDB_DATA2_DST_INFO_HI,
+					   data[2]);
+
+		if (destination_type == QCA8386_FDB_DST_TYPE_PORT) {
+			if (destination_hi || destination_lo != port)
+				continue;
+
+			ret = qca8386_fdb_entry_modify(priv, data,
+						       QCA8386_FDB_OP_TYPE_DEL);
+		} else if (destination_type == QCA8386_FDB_DST_TYPE_PORT_MAP) {
+			if (!(destination_lo & BIT(port)))
+				continue;
+
+			destination_lo &= ~BIT(port);
+			if (!destination_lo && !destination_hi) {
+				ret = qca8386_fdb_entry_modify(priv, data,
+							       QCA8386_FDB_OP_TYPE_DEL);
+			} else {
+				data[1] &= ~QCA8386_FDB_DATA1_DST_INFO_LO;
+				data[1] |= FIELD_PREP(QCA8386_FDB_DATA1_DST_INFO_LO,
+						      destination_lo);
+				ret = qca8386_fdb_entry_modify(priv, data,
+							       QCA8386_FDB_OP_TYPE_ADD);
+			}
+		}
+
+		if (ret)
+			break;
+	}
+
+	mutex_unlock(&priv->fdb_lock);
+
+	return ret;
 }
 
 static int qca8386_read_switch_id(struct qca8386_priv *priv)
@@ -799,11 +991,12 @@ err_clk_disable:
 	return ret;
 }
 
-/* Keep bridge forwarding in software for the diagnostic driver. QCA8386/MHT
- * ATU flush semantics are not established by a public programming reference,
- * so enabling autonomous learning would leave no proven way to fast-age stale
- * entries. setup() therefore keeps each user port connected only to its CPU
- * port and leaves QCA8386_PORT_LOOKUP_LEARN clear.
+/* Keep bridge forwarding in software for the diagnostic driver. Public QSDK
+ * 12.1 SSDK plus the matching BE65 binary now establish the MHT/HPPE FDB walk
+ * and per-port fast-age behavior implemented below. setup() still keeps each
+ * user port connected only to its CPU port and leaves autonomous learning clear
+ * until the high FDB register window has been exercised on separately authorized
+ * hardware.
  */
 
 /* Move a user port to another CPU port (conduit). Modelled on
@@ -1034,6 +1227,17 @@ static void qca8386_port_stp_state_set(struct dsa_switch *ds, int port, u8 state
 			port, ret);
 }
 
+static void qca8386_port_fast_age(struct dsa_switch *ds, int port)
+{
+	struct qca8386_priv *priv = ds->priv;
+	int ret;
+
+	ret = qca8386_fdb_fast_age_port(priv, port);
+	if (ret)
+		dev_err(priv->dev, "port %d: failed to fast-age FDB: %d\n",
+			port, ret);
+}
+
 static void qca8386_teardown(struct dsa_switch *ds)
 {
 	struct qca8386_priv *priv = ds->priv;
@@ -1049,6 +1253,7 @@ static const struct dsa_switch_ops qca8386_switch_ops = {
 	.port_enable		= qca8386_port_enable,
 	.port_disable		= qca8386_port_disable,
 	.port_stp_state_set	= qca8386_port_stp_state_set,
+	.port_fast_age		= qca8386_port_fast_age,
 	.port_change_conduit	= qca8386_port_change_conduit,
 };
 
@@ -1066,6 +1271,7 @@ static int qca8386_sw_probe(struct mdio_device *mdiodev)
 	priv->dev = &mdiodev->dev;
 	priv->bus = mdiodev->bus;
 	priv->info = of_device_get_match_data(priv->dev);
+	mutex_init(&priv->fdb_lock);
 	if (!priv->info)
 		return -EINVAL;
 

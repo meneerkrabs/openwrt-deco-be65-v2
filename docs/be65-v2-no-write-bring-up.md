@@ -33,7 +33,7 @@ all of the following:
 
 Any failed or ambiguous check stops the procedure.
 
-## Validated off-device build record V7 (2026-11-11)
+## Validated off-device build record V10 (2026-11-17)
 
 The final diagnostic artifact was built and inspected entirely off-device. The
 builder was disconnected before, during, and after compilation and final
@@ -41,8 +41,8 @@ inspection (`NetworkSettings.Networks = {}`). OpenWrt's `sha256sums` file
 verified every published target file.
 
 - artifact: `openwrt-qualcommbe-ipq53xx-tplink_be65-v2-initramfs-uImage.itb`
-- size: 22,247,680 bytes
-- SHA-256: `8e7223c715e6fc59568842a5d4c2b2077b62614368e3010d9aeabcbd3f98a5e7`
+- size: 22,248,688 bytes
+- SHA-256: `8ace1f785ae30c620ed0d40cd0cc000e11781a6f96d866208e46ab13526bd519`
 - FIT default and sole configuration: `config@BE65_2_0_0`
 - image nodes: `kernel-1` and `fdt-1`
 - persistent-install artifacts: none
@@ -52,6 +52,15 @@ BAM, integrated Wi-Fi, the PCIe1 root controller, its two-lane PHY at
 `phy@4b1000`, and the static QCN9224 endpoint are disabled. It also verified
 that QCA8386 port 0 references the proven `dp2` conduit, only `lan1`--`lan3`
 are enabled user ports, and WAN/CPU port 5 remain disabled.
+
+V10 contains the public-source/vendor-binary-backed 2,048-entry MHT FDB
+fast-age path, QCA8084 cable-diagnostic thresholds plus the vendor-required soft
+reset after ADC edge selection, and fail-closed ath12k rxgainlut capability
+state. Autonomous learning, bridge offload and both radios remain off; these
+code paths are compiled but still require separately authorized runtime
+evidence. Repeated in-place packaging changed APK size metadata while preserving
+the same source and semantic checks, so this record pins the exact inspected
+artifact rather than claiming bit-for-bit build reproducibility.
 
 This hash identifies the validated artifact only. Recording or reviewing it
 does not authorize contacting the router, loading the artifact, or booting or

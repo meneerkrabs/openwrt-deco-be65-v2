@@ -7,6 +7,7 @@ Port the public QSDK protocol extension with the following behavior:
 
 * decode capability TLV 0x25 as the u8 that the response structure
   actually contains;
+* clear cached support when the optional TLV is absent;
 * look for a board-2.bin type-2 entry first;
 * fall back to rxgainlut.b<board-id>, then rxgainlut.bin; and
 * download the result using QMI BDF type 7.
@@ -155,8 +156,8 @@ index fd762b5..393bea0 100644
  	{
 @@ -2934,2 +2952,5 @@ int ath12k_qmi_request_target_cap(struct ath12k_base *ab)
  
-+	if (resp.rxgainlut_support_valid)
-+		ab->rxgainlut_support = !!resp.rxgainlut_support;
++	ab->rxgainlut_support = resp.rxgainlut_support_valid &&
++				    !!resp.rxgainlut_support;
 +
  	ath12k_info(ab, "chip_id 0x%x chip_family 0x%x board_id 0x%x soc_id 0x%x\n",
 @@ -3084,2 +3105,9 @@ int ath12k_qmi_load_bdf_qmi(struct ath12k_base *ab,

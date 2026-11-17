@@ -1,3 +1,35 @@
+# Experimental OpenWrt port for TP-Link Deco BE65 V2
+
+This public branch contains an **off-device research port** for the TP-Link Deco
+BE65 V2 (IPQ5332 + QCA8386/QCA8084 + QCN9224). It is based on the buildable
+`perceival/openwrt-flint3` Linux 6.18 tree.
+
+> [!CAUTION]
+> **Do not flash or boot the BE65 V2 image.** The current profile is an
+> initramfs-only diagnostic build whose storage and Wi-Fi paths are deliberately
+> disabled. It has compiled and passed static/FIT/DT checks, but has not run on
+> BE65 hardware. No factory, sysupgrade or persistent-install image is produced.
+
+Key properties:
+
+- conservative LAN-only topology: `lan1` through `lan3`;
+- WAN, secondary CPU conduit, NAND/QPIC and both radios disabled;
+- QCA8386 DSA and QCA8084 package support under active clean-room development;
+- user-supplied Qualcomm firmware/board data is staged locally and excluded
+  from Git;
+- no TP-Link firmware, dumps, ART data, calibration blobs, decompiler output or
+  prebuilt BE65 image is published here.
+
+See:
+
+- [`docs/be65-v2-no-write-bring-up.md`](docs/be65-v2-no-write-bring-up.md)
+- [`vendor-driver-port-plan.md`](vendor-driver-port-plan.md)
+
+The original Flint 3 documentation is retained below because this repository is
+a full, buildable fork of that work.
+
+---
+
 # OpenWrt for the GL.iNet Flint 3 (GL-BE9300)
 
 <a href="https://ko-fi.com/C8Y320ZTT2"><img src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" height="36" alt="Buy Me a Coffee at ko-fi.com"></a>

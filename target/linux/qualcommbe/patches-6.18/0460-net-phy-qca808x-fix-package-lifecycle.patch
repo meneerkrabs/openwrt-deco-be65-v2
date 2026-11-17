@@ -9,9 +9,11 @@ Add a package-wide mutex, serialize QCA8084 probe, configuration and
 remove, and keep explicit successful-user and resource state. Build the
 PHY and SerDes support as one module, unwind partial setup, disable package
 clock consumers before their SerDes source, resume interrupted SerDes
-cleanup, retain and reassert the package reset, pair each per-PHY reset
-with devres teardown, preserve failed clock-parent state during recoverable
-setup unwind, and reject ambiguous PCS/XPCS descriptions.
+cleanup, retain and reassert the package reset, and pair each per-PHY
+reset with devres teardown. Apply vendor-confirmed cable-diagnostic
+thresholds, reset each PHY after ADC edge selection, preserve failed clock
+parent state during recoverable setup unwind, and reject ambiguous PCS/XPCS
+descriptions.
 
 Signed-off-by: Claude Code <noreply@anthropic.com>
 ---
@@ -828,10 +830,34 @@ index b943529..2663827 100644
  			      struct mdio_device *pcs_mdiodev,
  			      int channel, int speed);
 diff --git a/drivers/net/phy/qcom/qca808x.c b/drivers/net/phy/qcom/qca808x.c
-index 64f8c56..4cbe712 100644
+index 64f8c56..eaa7cb8 100644
 --- a/drivers/net/phy/qcom/qca808x.c
 +++ b/drivers/net/phy/qcom/qca808x.c
-@@ -188,9 +188,14 @@ struct qca808x_priv {
+@@ -109,6 +109,23 @@
+ #define QCA8084_MSE_THRESHOLD			0x800a
+ #define QCA8084_MSE_THRESHOLD_2P5G_VAL		0x51c6
+ 
++#define QCA8084_CDT_THRESH_CTRL3		0x8074
++#define QCA8084_CDT_THRESH_CTRL4		0x8075
++#define QCA8084_CDT_THRESH_CTRL5		0x8076
++#define QCA8084_CDT_THRESH_CTRL6		0x8077
++#define QCA8084_CDT_THRESH_CTRL7		0x8078
++#define QCA8084_CDT_THRESH_CTRL9		0x807a
++#define QCA8084_CDT_THRESH_CTRL13		0x807e
++#define QCA8084_CDT_THRESH_CTRL14		0x807f
++#define QCA8084_CDT_THRESH_CTRL3_VAL		0xc040
++#define QCA8084_CDT_THRESH_CTRL4_VAL		0xa060
++#define QCA8084_CDT_THRESH_CTRL5_VAL		0xc040
++#define QCA8084_CDT_THRESH_CTRL6_VAL		0xa060
++#define QCA8084_CDT_THRESH_CTRL7_VAL		0xc050
++#define QCA8084_CDT_THRESH_CTRL9_VAL		0xc060
++#define QCA8084_CDT_THRESH_CTRL13_VAL		0xb060
++#define QCA8084_CDT_NEAR_ECHO_THRESH_VAL	0x1eb0
++
+ /* QCA8084 FIFO reset control */
+ #define QCA8084_FIFO_CONTROL			0x19
+ #define QCA8084_FIFO_MAC_2_PHY			BIT(1)
+@@ -188,9 +205,14 @@ struct qca808x_priv {
  };
  
  struct qca808x_shared_priv {
@@ -847,7 +873,7 @@ index 64f8c56..4cbe712 100644
  };
  
  static const char *const qca8084_package_clk_name[PACKAGE_CLK_MAX] = {
-@@ -868,6 +873,36 @@ static void qca808x_get_phy_stats(struct phy_device *phydev,
+@@ -868,6 +890,36 @@ static void qca808x_get_phy_stats(struct phy_device *phydev,
  	qcom_phy_get_stats(stats, priv->hw_stats);
  }
  
@@ -884,7 +910,7 @@ index 64f8c56..4cbe712 100644
  static int qca8084_package_clock_init(struct qca808x_shared_priv *shared_priv)
  {
  	int ret;
-@@ -885,46 +920,71 @@ static int qca8084_package_clock_init(struct qca808x_shared_priv *shared_priv)
+@@ -885,46 +937,71 @@ static int qca8084_package_clock_init(struct qca808x_shared_priv *shared_priv)
  
  	ret = clk_prepare_enable(shared_priv->clk[APB_BRIDGE_CLK]);
  	if (ret)
@@ -966,7 +992,7 @@ index 64f8c56..4cbe712 100644
  
  	shared_priv = phy_package_get_priv(phydev);
  	switch (shared_priv->package_mode) {
-@@ -938,7 +998,7 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
+@@ -938,7 +1015,7 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
  		mode = QCA8084_WORK_MODE_SWITCH_PORT4_SGMII;
  		break;
  	default:
@@ -975,7 +1001,7 @@ index 64f8c56..4cbe712 100644
  			   shared_priv->package_mode);
  		return -EINVAL;
  	}
-@@ -1012,18 +1072,42 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
+@@ -1012,18 +1089,73 @@ static int qca8084_phy_package_config_init_once(struct phy_device *phydev)
  	/* Initialize the PHY package clock and reset, which is the
  	 * necessary config sequence after GPIO reset on the PHY package.
  	 */
@@ -999,6 +1025,37 @@ index 64f8c56..4cbe712 100644
 +	}
 +
 +	return ret;
++}
++
++struct qca8084_cdt_tuning {
++	u16 reg;
++	u16 val;
++};
++
++static const struct qca8084_cdt_tuning qca8084_cdt_tunings[] = {
++	{ QCA8084_CDT_THRESH_CTRL3, QCA8084_CDT_THRESH_CTRL3_VAL },
++	{ QCA8084_CDT_THRESH_CTRL4, QCA8084_CDT_THRESH_CTRL4_VAL },
++	{ QCA8084_CDT_THRESH_CTRL5, QCA8084_CDT_THRESH_CTRL5_VAL },
++	{ QCA8084_CDT_THRESH_CTRL6, QCA8084_CDT_THRESH_CTRL6_VAL },
++	{ QCA8084_CDT_THRESH_CTRL7, QCA8084_CDT_THRESH_CTRL7_VAL },
++	{ QCA8084_CDT_THRESH_CTRL9, QCA8084_CDT_THRESH_CTRL9_VAL },
++	{ QCA8084_CDT_THRESH_CTRL13, QCA8084_CDT_THRESH_CTRL13_VAL },
++	{ QCA8084_CDT_THRESH_CTRL14, QCA8084_CDT_NEAR_ECHO_THRESH_VAL },
++};
++
++static int qca8084_cdt_threshold_init(struct phy_device *phydev)
++{
++	int ret, i;
++
++	for (i = 0; i < ARRAY_SIZE(qca8084_cdt_tunings); i++) {
++		ret = phy_write_mmd(phydev, MDIO_MMD_PCS,
++				    qca8084_cdt_tunings[i].reg,
++				    qca8084_cdt_tunings[i].val);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
  }
  
  static int qca8084_config_init(struct phy_device *phydev)
@@ -1021,7 +1078,30 @@ index 64f8c56..4cbe712 100644
  
  	if (phydev->interface == PHY_INTERFACE_MODE_10G_QXGMII)
  		__set_bit(PHY_INTERFACE_MODE_10G_QXGMII,
-@@ -1047,6 +1131,10 @@ static int qca8084_config_init(struct phy_device *phydev)
+@@ -1031,6 +1163,11 @@ static int qca8084_config_init(struct phy_device *phydev)
+ 	else
+ 		qca808x_fill_possible_interfaces(phydev);
+ 
++	/* Match the QCA8084 package's cable-diagnostic threshold tuning. */
++	ret = qca8084_cdt_threshold_init(phydev);
++	if (ret < 0)
++		return ret;
++
+ 	/* Configure the ADC to convert the signal using falling edge
+ 	 * instead of the default rising edge.
+ 	 */
+@@ -1041,12 +1178,21 @@ static int qca8084_config_init(struct phy_device *phydev)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* The vendor resets each PHY after changing the ADC clock edge. */
++	ret = genphy_soft_reset(phydev);
++	if (ret < 0)
++		return ret;
++
+ 	/* Adjust MSE threshold value to avoid link issue with
+ 	 * some link partner.
+ 	 */
  	return phy_write_mmd(phydev, MDIO_MMD_PMAPMD,
  			     QCA8084_MSE_THRESHOLD,
  			     QCA8084_MSE_THRESHOLD_2P5G_VAL);
@@ -1032,7 +1112,7 @@ index 64f8c56..4cbe712 100644
  }
  
  static void qca8084_link_change_notify(struct phy_device *phydev)
-@@ -1116,12 +1204,11 @@ static void qca8084_link_change_notify(struct phy_device *phydev)
+@@ -1116,12 +1262,11 @@ static void qca8084_link_change_notify(struct phy_device *phydev)
   */
  static int qca8084_phy_package_probe_once(struct phy_device *phydev)
  {
@@ -1047,7 +1127,7 @@ index 64f8c56..4cbe712 100644
  	struct clk *clk;
  
  	/* Program the MDIO address of PHY and PCS optionally, the MDIO
-@@ -1132,6 +1219,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+@@ -1132,6 +1277,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
  	if (ret && ret != -EINVAL)
  		return ret;
  
@@ -1058,7 +1138,7 @@ index 64f8c56..4cbe712 100644
  	/* Configure the MDIO addresses for the four PHY devices. */
  	clear = QCA8084_EPHY_ADDR0_MASK | QCA8084_EPHY_ADDR1_MASK |
  		QCA8084_EPHY_ADDR2_MASK | QCA8084_EPHY_ADDR3_MASK;
-@@ -1161,12 +1252,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+@@ -1161,12 +1310,10 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
  	for (i = 0; i < ARRAY_SIZE(qca8084_package_clk_name); i++) {
  		clk = of_clk_get_by_name(np, qca8084_package_clk_name[i]);
  		if (IS_ERR(clk)) {
@@ -1075,7 +1155,7 @@ index 64f8c56..4cbe712 100644
  		}
  
  		shared_priv->clk[i] = clk;
-@@ -1179,91 +1268,195 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
+@@ -1179,91 +1326,195 @@ static int qca8084_phy_package_probe_once(struct phy_device *phydev)
  	ret = of_property_read_u32(np, "qcom,package-mode",
  				   &shared_priv->package_mode);
  	if (ret && ret != -EINVAL)
@@ -1150,9 +1230,7 @@ index 64f8c56..4cbe712 100644
 +	shared_priv->resources_acquired = true;
 +
 +	return 0;
- 
--	/* Deassert PHY package. */
--	return reset_control_deassert(rstc);
++
 +err_mdiodev_put:
 +	cleanup_ret = qca8084_package_xpcs_and_pcs_remove(shared_priv->mdiodev[1],
 +							  shared_priv->mdiodev[0]);
@@ -1160,7 +1238,9 @@ index 64f8c56..4cbe712 100644
 +	shared_priv->mdiodev[1] = NULL;
 +err_clock_put:
 +	qca8084_package_clock_put(shared_priv);
-+
+ 
+-	/* Deassert PHY package. */
+-	return reset_control_deassert(rstc);
 +	return cleanup_ret ? cleanup_ret : ret;
  }
  
@@ -1170,12 +1250,12 @@ index 64f8c56..4cbe712 100644
 -	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);;
 +	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);
 +	int first_err, ret;
-+
-+	if (!shared_priv->resources_acquired)
-+		return 0;
  
 -	qca8084_package_xpcs_and_pcs_remove(shared_priv->mdiodev[1],
 -					    shared_priv->mdiodev[0]);
++	if (!shared_priv->resources_acquired)
++		return 0;
++
 +	/* Package clocks consume the SerDes clock. Disable the consumers before
 +	 * asserting the PCS reset or disabling its source clock.
 +	 */
@@ -1243,7 +1323,12 @@ index 64f8c56..4cbe712 100644
 +				    "Enable PHY clock failed\n");
 +		goto err_package_probe;
 +	}
-+
+ 
+-	/* De-assert PHY reset after the clock of PHY enabled. */
+-	rstc = devm_reset_control_get_exclusive(dev, NULL);
+-	if (IS_ERR(rstc))
+-		return dev_err_probe(dev, PTR_ERR(rstc),
+-				     "Get PHY reset failed\n");
 +	/* Deassert the PHY reset after enabling its clock, and let devres assert it
 +	 * again before releasing the reset on detach or probe failure.
 +	 */
@@ -1253,16 +1338,10 @@ index 64f8c56..4cbe712 100644
 +				    "Get and deassert PHY reset failed\n");
 +		goto err_package_probe;
 +	}
- 
--	/* De-assert PHY reset after the clock of PHY enabled. */
--	rstc = devm_reset_control_get_exclusive(dev, NULL);
--	if (IS_ERR(rstc))
--		return dev_err_probe(dev, PTR_ERR(rstc),
--				     "Get PHY reset failed\n");
++
 +	shared_priv->users++;
 +	phy_package_unlock(phydev);
- 
--	return reset_control_deassert(rstc);
++
 +	return 0;
 +
 +err_package_probe:
@@ -1274,7 +1353,8 @@ index 64f8c56..4cbe712 100644
 +	}
 +out_unlock:
 +	phy_package_unlock(phydev);
-+
+ 
+-	return reset_control_deassert(rstc);
 +	return ret;
  }
  
@@ -1284,13 +1364,13 @@ index 64f8c56..4cbe712 100644
 -		return;
 +	struct qca808x_shared_priv *shared_priv = phy_package_get_priv(phydev);
 +	int ret = 0;
-+
-+	phy_package_lock(phydev);
-+	if (WARN_ON(!shared_priv->users))
-+		goto out_unlock;
  
 -	if (phy_package_remove_once(phydev))
 -		qca8084_phy_package_remove_once(phydev);
++	phy_package_lock(phydev);
++	if (WARN_ON(!shared_priv->users))
++		goto out_unlock;
++
 +	shared_priv->users--;
 +	if (!shared_priv->users)
 +		ret = qca8084_phy_package_remove(phydev);

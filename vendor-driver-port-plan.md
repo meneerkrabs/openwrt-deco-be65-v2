@@ -67,11 +67,12 @@ qca-ssdk (QCA8386 switch + QCA8084 PHY support)
 
 The 6.18 tree now contains a dedicated QCA8386 DSA driver, QCA8084 package
 support, and the conservative BE65 wiring: one proven CPU conduit (`dp2`), LAN
-ports 1--3 enabled, and WAN/CPU port 5 disabled. The diagnostic driver keeps
-QCA8386 autonomous learning and LAN-to-LAN bridge offload disabled because no
-public MHT reference proves the ATU fast-age command; Linux bridges therefore
-forward through the CPU. This is still experimental and requires off-device
-validation before any separately authorized RAM boot.
+ports 1--3 enabled, and WAN/CPU port 5 disabled. Public QSDK 12.1 SSDK plus the
+matching BE65 binary now establish MHT's 2,048-entry HPPE FDB walk and per-port
+dynamic-entry removal; the driver implements that behavior as `.port_fast_age`.
+Autonomous learning and LAN-to-LAN bridge offload remain disabled until the high
+FDB register window is exercised on separately authorized hardware, so Linux
+bridges still forward through the CPU. This remains experimental.
 
 ## 2. What QCN9224 versus QCN9274 actually means
 
@@ -202,10 +203,13 @@ hardware use.
 ### Phase C — Ethernet bring-up
 
 The QCA8386/QCA8084 series now compiles against Linux 6.18 and represents only
-the proven LAN topology. Its first profile deliberately uses software bridging,
-disables WAN/CPU port 5, and does not claim PPE/NSS throughput. Link and 2.5G
-behavior still require the separately gated, no-write RAM-boot procedure after
-the final off-device artifact is reviewed.
+the proven LAN topology. The driver has a source-backed HPPE FDB fast-age path,
+and QCA8084 init now includes the vendor-confirmed cable-diagnostic thresholds
+before ADC/MSE tuning. Per-port ICC efuse retrimming remains deferred because it
+also changes MDIO clocking. The first profile deliberately keeps autonomous
+learning and bridge offload disabled, disables WAN/CPU port 5, and does not
+claim PPE/NSS throughput. Link, 2.5G and high-window FDB behavior still require
+the separately gated no-write RAM-boot procedure.
 
 ### Phase D — QCN9224 downstream-ath12k port
 
@@ -254,12 +258,14 @@ the final off-device artifact is reviewed.
 ## 8. Current engineering status and next gate
 
 1. Keep every experimental image blocked from hardware use.
-2. The clean V7 build completed with the builder network disconnected before,
-   during, and after compilation and inspection.
-3. The FIT output set and embedded DT passed deterministic checks; the final
-   size and hash are recorded in `docs/be65-v2-no-write-bring-up.md`.
-4. A focused independent source review found no reachable correctness defect in
-   the reviewed blocker fixes. Hardware-dependent behavior remains unproven by
-   design.
+2. The clean V10 build completed with the builder network disconnected before,
+   during, and after compilation and inspection. It contains source-backed MHT
+   FDB fast-age, QCA8084 CDT/ADC-reset tuning and fail-closed ath12k rxgainlut
+   capability state.
+3. The FIT output set and embedded DT passed deterministic checks; the V10 size
+   and hash are recorded in `docs/be65-v2-no-write-bring-up.md`.
+4. Independent reviews found no remaining source-level correctness defect in
+   the FDB or QCA8084 changes. Hardware-dependent timing, register readback and
+   analog behavior remain unproven by design.
 5. Any Gate 1 read-only router contact now requires a new explicit user
    decision; no current text authorizes router contact, loading, boot, or flash.
